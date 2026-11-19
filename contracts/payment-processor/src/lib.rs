@@ -317,6 +317,12 @@ impl PaymentProcessor {
         Self::update(&env, |c| c.fee_bps = fee_bps)
     }
 
+    pub fn set_fee_recipient(env: Env, recipient: Address) -> Result<(), PaymentError> {
+        let mut config = Self::config(&env)?;
+        config.admin.require_auth();
+        Self::update(&env, |c| c.treasury = recipient)
+    }
+
     pub fn set_treasury(env: Env, treasury: Address) -> Result<(), PaymentError> {
         Self::update(&env, |c| c.treasury = treasury)
     }
@@ -435,7 +441,7 @@ impl PaymentProcessor {
             None => 0,
         };
 
-        let id = Self::payment_count(env.clone()) + 1;
+        let id = Self::payment_count(env.clone()).checked_add(1).ok_or(PaymentError::Overflow)?;
         let payment = Payment {
             id,
             payer: payer.clone(),
