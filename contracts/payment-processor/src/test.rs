@@ -3,7 +3,11 @@ extern crate std;
 use super::*;
 use loyalty_program::{LoyaltyProgram, LoyaltyProgramClient};
 use merchant_registry::{MerchantRegistry, MerchantRegistryClient};
-use soroban_sdk::{testutils::Address as _, token::StellarAssetClient, vec, Env, String};
+use soroban_sdk::{
+    testutils::{Address as _, Events},
+    token::StellarAssetClient,
+    vec, Env, Event, String,
+};
 
 const UNIT: i128 = 10_000_000;
 
@@ -75,7 +79,7 @@ fn payment_splits_fee_to_treasury_and_net_to_settlement() {
         &(100 * UNIT),
         &order(&s.env, "ORD-1001"),
     );
-    assert_eq!(id, 1);
+    assert_eq!(s.pp.payment_count(), 1);
 
     assert_eq!(s.token.balance(&s.settlement), 975 * UNIT / 10);
     assert_eq!(s.token.balance(&s.treasury), 25 * UNIT / 10);
@@ -266,6 +270,108 @@ fn second_merchant(s: &Setup) -> (Address, Address) {
 }
 
 #[test]
+fn payment_ids_are_hashed_not_sequential() {
+    let s = setup(0);
+    let a = s.pp.pay(
+        &s.payer,
+        &s.merchant,
+        &s.asset,
+        &UNIT,
+        &order(&s.env, "H-1"),
+    );
+    let b = s.pp.pay(
+        &s.payer,
+        &s.merchant,
+        &s.asset,
+        &UNIT,
+        &order(&s.env, "H-2"),
+    );
+    assert_ne!(a, 1);
+    assert_ne!(b, a + 1, "the next id cannot be read off the counter");
+    assert_eq!(s.pp.payment_count(), 2);
+    assert_eq!(s.pp.get_payment(&b).order_ref, order(&s.env, "H-2"));
+    assert_eq!(
+        s.pp.payment_for_order(&s.merchant, &order(&s.env, "H-1"))
+            .id,
+        a
+    );
+}
+
+#[test]
+fn every_sale_and_refund_emits_a_compliance_record() {
+    let s = setup(250);
+    let id = s.pp.pay(
+        &s.payer,
+        &s.merchant,
+        &s.asset,
+        &(100 * UNIT),
+        &order(&s.env, "C-1"),
+    );
+    let mut record = ComplianceRecord {
+        kind: symbol_short!("payment"),
+        merchant: s.merchant.clone(),
+        payment_id: id,
+        payer: s.payer.clone(),
+        settlement: s.settlement.clone(),
+        asset: s.asset.clone(),
+        amount: 100 * UNIT,
+        fee: 25 * UNIT / 10,
+        order_ref: order(&s.env, "C-1"),
+        timestamp: s.env.ledger().timestamp(),
+    };
+    let emitted = s.env.events().all().filter_by_contract(&s.pp.address);
+    assert!(emitted
+        .events()
+        .contains(&record.to_xdr(&s.env, &s.pp.address)));
+
+    s.pp.refund(&id, &(10 * UNIT), &String::from_str(&s.env, "returned"));
+    record.kind = symbol_short!("refund");
+    record.amount = 10 * UNIT;
+    record.fee = 0;
+    let emitted = s.env.events().all().filter_by_contract(&s.pp.address);
+    assert!(emitted
+        .events()
+        .contains(&record.to_xdr(&s.env, &s.pp.address)));
+}
+
+/// A token whose `transfer` reports success but moves nothing.
+#[contract]
+pub struct LyingToken;
+
+#[contractimpl]
+impl LyingToken {
+    pub fn transfer(_env: Env, _from: Address, _to: Address, _amount: i128) {}
+
+    pub fn balance(_env: Env, _id: Address) -> i128 {
+        0
+    }
+}
+
+#[test]
+fn a_token_that_does_not_move_funds_is_rejected() {
+    let s = setup(100);
+    let fake = s.env.register(LyingToken, ());
+    let merchant = Address::generate(&s.env);
+    s.registry.register(
+        &merchant,
+        &String::from_str(&s.env, "Fake Shop"),
+        &Address::generate(&s.env),
+        &vec![&s.env, fake.clone()],
+    );
+    s.registry.approve(&merchant);
+
+    assert_eq!(
+        s.pp.try_pay(&s.payer, &merchant, &fake, &UNIT, &order(&s.env, "F-1")),
+        Err(Ok(PaymentError::TransferFailed))
+    );
+    assert_eq!(s.pp.payment_count(), 0);
+    assert_eq!(
+        s.pp.try_payment_for_order(&merchant, &order(&s.env, "F-1")),
+        Err(Ok(PaymentError::PaymentNotFound))
+    );
+}
+
+#[test]
 fn batch_settles_every_line_across_merchants() {
     let s = setup(100);
     let (m2, settle2) = second_merchant(&s);
@@ -279,7 +385,12 @@ fn batch_settles_every_line_across_merchants() {
             line(&s.merchant, 30 * UNIT, order(&s.env, "TAB-2")),
         ],
     );
-    assert_eq!(ids, vec![&s.env, 1u64, 2, 3]);
+    assert_eq!(ids.len(), 3);
+    assert_eq!(s.pp.payment_count(), 3);
+    for (i, r) in ["TAB-1", "INV-9", "TAB-2"].iter().enumerate() {
+        let id = ids.get(i as u32).unwrap();
+        assert_eq!(s.pp.get_payment(&id).order_ref, order(&s.env, r));
+    }
     // 1% fee per line, net to each merchant's settlement account.
     assert_eq!(s.token.balance(&s.settlement), 396 * UNIT / 10);
     assert_eq!(s.token.balance(&settle2), 198 * UNIT / 10);
