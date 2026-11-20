@@ -18,7 +18,7 @@
 
 #![no_std]
 
-use shared::{extend_instance, extend_persistent, BPS_DENOMINATOR};
+use shared::{extend_instance, extend_persistent, is_entry_valid, BPS_DENOMINATOR};
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, Vec,
 };
@@ -239,16 +239,11 @@ impl LoyaltyProgram {
 
     /// Processors currently allowed to accrue points.
     pub fn processors(env: Env) -> Vec<Address> {
-        let mut list: Vec<Address> = env
-            .storage()
-            .instance()
+        let storage = env.storage().instance();
+        let mut list: Vec<Address> = storage
             .get(&DataKey::Processors)
             .unwrap_or_else(|| Vec::new(&env));
-        if let Some(legacy) = env
-            .storage()
-            .instance()
-            .get::<_, Address>(&DataKey::Processor)
-        {
+        if let Some(legacy) = storage.get::<_, Address>(&DataKey::Processor) {
             if !list.contains(&legacy) {
                 list.push_front(legacy);
             }
@@ -479,8 +474,9 @@ impl LoyaltyProgram {
 
     /// Stores the allowlist and retires the legacy single-processor key.
     fn save_processors(env: &Env, list: &Vec<Address>) {
-        env.storage().instance().set(&DataKey::Processors, list);
-        env.storage().instance().remove(&DataKey::Processor);
+        let storage = env.storage().instance();
+        storage.set(&DataKey::Processors, list);
+        storage.remove(&DataKey::Processor);
         extend_instance(env);
     }
 
