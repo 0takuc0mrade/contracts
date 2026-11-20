@@ -141,10 +141,11 @@ fn signer_rotation_and_removed_signer_approvals_stop_counting() {
     // c approves a withdrawal, then gets removed before it executes.
     let to = Address::generate(&s.env);
     let w = s.t.propose(
-        &s.c,
+        &s.a,
         &Action::Withdraw(s.asset.clone(), to, 10),
         &memo(&s.env),
     );
+    s.t.approve(&s.c, &w);
     let rm =
         s.t.propose(&s.a, &Action::RemoveSigner(s.c.clone()), &memo(&s.env));
     s.t.approve(&d, &rm);
@@ -155,12 +156,44 @@ fn signer_rotation_and_removed_signer_approvals_stop_counting() {
         Err(Ok(TreasuryError::NotEnoughApprovals))
     );
     s.t.approve(&d, &w);
-    assert_eq!(
-        s.t.try_execute(&w),
-        Err(Ok(TreasuryError::NotEnoughApprovals))
+    s.t.execute(&w);
+}
+
+#[test]
+fn removing_a_signer_cancels_their_open_proposals() {
+    let s = setup();
+    let to = Address::generate(&s.env);
+    // c queues a withdrawal that a and b approve, so it would still have
+    // enough valid approvals after c is gone.
+    let w = s.t.propose(
+        &s.c,
+        &Action::Withdraw(s.asset.clone(), to, 10),
+        &memo(&s.env),
     );
     s.t.approve(&s.a, &w);
-    s.t.execute(&w);
+    s.t.approve(&s.b, &w);
+    let other = s.t.propose(&s.b, &Action::Unfreeze, &memo(&s.env));
+
+    let rm =
+        s.t.propose(&s.a, &Action::RemoveSigner(s.c.clone()), &memo(&s.env));
+    s.t.approve(&s.b, &rm);
+    s.t.execute(&rm);
+
+    assert_eq!(s.t.get_proposal(&w).status, ProposalStatus::Cancelled);
+    assert_eq!(s.t.try_execute(&w), Err(Ok(TreasuryError::Cancelled)));
+    assert_eq!(s.t.balance(&s.asset), 1_000);
+    assert_eq!(s.t.get_proposal(&other).status, ProposalStatus::Open);
+}
+
+#[test]
+fn a_signer_can_still_propose_their_own_removal() {
+    let s = setup();
+    let rm =
+        s.t.propose(&s.c, &Action::RemoveSigner(s.c.clone()), &memo(&s.env));
+    s.t.approve(&s.a, &rm);
+    s.t.execute(&rm);
+    assert_eq!(s.t.get_proposal(&rm).status, ProposalStatus::Executed);
+    assert_eq!(s.t.get_signers().len(), 2);
 }
 
 #[test]

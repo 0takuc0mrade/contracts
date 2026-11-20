@@ -13,13 +13,18 @@
 //!
 //! Refunds are pushed by the merchant's settlement account (which received
 //! the funds) back to the original payer, up to the gross amount paid.
+//!
+//! Every transfer is checked against the recipient's balance, so a token that
+//! reports success without moving funds is rejected. Payment IDs are derived
+//! from a hash, not a counter, and every sale and refund also emits a
+//! `ComplianceRecord` for off-chain reporting tools.
 
 #![no_std]
 
 use shared::{extend_instance, extend_persistent, split_fee, MAX_FEE_BPS};
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractevent, contractimpl, contracttype, token,
-    Address, Env, Map, String, Vec,
+    contract, contractclient, contracterror, contractevent, contractimpl, contracttype,
+    symbol_short, token, xdr::ToXdr, Address, Env, Map, String, Symbol, Vec,
 };
 
 pub const MAX_ORDER_REF_LEN: u32 = 64;
@@ -74,6 +79,8 @@ pub enum PaymentError {
     AlreadyRefunded = 11,
     Overflow = 12,
     InvalidBatch = 13,
+    /// The token did not credit the recipient with the amount transferred.
+    TransferFailed = 14,
     InvalidSplit = 14,
     Reentrancy = 15,
 }
@@ -181,6 +188,27 @@ pub struct PaymentRefunded {
     pub amount: i128,
     pub total_refunded: i128,
     pub reason: String,
+}
+
+/// One record per money movement, with every field a compliance report
+/// needs. All records share the `compliance` topic, so a reporting tool can
+/// follow sales and refunds with a single subscription. `kind` is `payment`
+/// (payer to settlement) or `refund` (settlement to payer).
+#[contractevent(topics = ["compliance"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComplianceRecord {
+    #[topic]
+    pub kind: Symbol,
+    #[topic]
+    pub merchant: Address,
+    pub payment_id: u64,
+    pub payer: Address,
+    pub settlement: Address,
+    pub asset: Address,
+    pub amount: i128,
+    pub fee: i128,
+    pub order_ref: String,
+    pub timestamp: u64,
 }
 
 #[contractevent]
@@ -464,6 +492,36 @@ impl PaymentProcessor {
         })
     }
 
+        let client = token::Client::new(&env, &payment.asset);
+        Self::transfer_checked(&client, &payment.settlement, &payment.payer, amount)?;
+
+        payment.refunded = total;
+        payment.status = if total == payment.amount {
+            PaymentStatus::Refunded
+        } else {
+            PaymentStatus::PartiallyRefunded
+        };
+        Self::save(&env, &payment);
+
+        ComplianceRecord {
+            kind: symbol_short!("refund"),
+            merchant: payment.merchant.clone(),
+            payment_id,
+            payer: payment.payer.clone(),
+            settlement: payment.settlement.clone(),
+            asset: payment.asset.clone(),
+            amount,
+            fee: 0,
+            order_ref: payment.order_ref.clone(),
+            timestamp: env.ledger().timestamp(),
+        }
+        .publish(&env);
+        PaymentRefunded {
+            merchant: payment.merchant,
+            payment_id,
+            amount,
+            total_refunded: total,
+            reason,
     /// Registers or clears a post-settlement callback contract for `merchant`.
     pub fn set_merchant_callback(
         env: Env,
@@ -613,10 +671,10 @@ impl PaymentProcessor {
         }
 
         let (fee, net) = split_fee(amount, config.fee_bps).ok_or(PaymentError::Overflow)?;
-        let token = token::Client::new(env, asset);
-        token.transfer(payer, &settlement, &net);
+        let client = token::Client::new(env, asset);
+        Self::transfer_checked(&client, payer, &settlement, net)?;
         if fee > 0 {
-            token.transfer(payer, &config.treasury, &fee);
+            Self::transfer_checked(&client, payer, &config.treasury, fee)?;
         }
 
         let loyalty_points = match &config.loyalty {
@@ -629,6 +687,10 @@ impl PaymentProcessor {
             None => 0,
         };
 
+        let count = Self::payment_count(env.clone())
+            .checked_add(1)
+            .ok_or(PaymentError::Overflow)?;
+        let id = Self::new_payment_id(env, payer, &merchant, &order_ref, count);
         let id = Self::payment_count(env.clone())
             .checked_add(1)
             .ok_or(PaymentError::Overflow)?;
@@ -649,9 +711,22 @@ impl PaymentProcessor {
         Self::save(env, &payment);
         env.storage().persistent().set(&order_key, &id);
         extend_persistent(env, &order_key);
-        env.storage().instance().set(&DataKey::PaymentCount, &id);
+        env.storage().instance().set(&DataKey::PaymentCount, &count);
         extend_instance(env);
 
+        ComplianceRecord {
+            kind: symbol_short!("payment"),
+            merchant: merchant.clone(),
+            payment_id: id,
+            payer: payer.clone(),
+            settlement: payment.settlement.clone(),
+            asset: asset.clone(),
+            amount,
+            fee,
+            order_ref: order_ref.clone(),
+            timestamp: payment.created_at,
+        }
+        .publish(env);
         PaymentSettled {
             merchant: merchant.clone(),
             payment_id: id,
@@ -667,6 +742,58 @@ impl PaymentProcessor {
         Ok(id)
     }
 
+    /// Transfers `amount` and confirms the recipient was credited exactly
+    /// that, so a token that reports success without moving funds (or skims
+    /// a fee) is rejected and the whole call reverts.
+    fn transfer_checked(
+        client: &token::Client,
+        from: &Address,
+        to: &Address,
+        amount: i128,
+    ) -> Result<(), PaymentError> {
+        if from == to {
+            client.transfer(from, to, &amount);
+            return Ok(());
+        }
+        let expected = client
+            .balance(to)
+            .checked_add(amount)
+            .ok_or(PaymentError::Overflow)?;
+        client.transfer(from, to, &amount);
+        if client.balance(to) != expected {
+            return Err(PaymentError::TransferFailed);
+        }
+        Ok(())
+    }
+
+    /// The first 8 bytes of a SHA-256 over the payment's own data and the
+    /// running count, so the next ID cannot be read off a counter. A
+    /// collision (or zero) moves on to the next nonce.
+    fn new_payment_id(
+        env: &Env,
+        payer: &Address,
+        merchant: &Address,
+        order_ref: &String,
+        count: u64,
+    ) -> u64 {
+        let mut nonce: u32 = 0;
+        loop {
+            let seed = (
+                merchant.clone(),
+                order_ref.clone(),
+                payer.clone(),
+                count,
+                env.ledger().sequence(),
+                nonce,
+            );
+            let digest = env.crypto().sha256(&seed.to_xdr(env)).to_array();
+            let mut head = [0u8; 8];
+            head.copy_from_slice(&digest[..8]);
+            let id = u64::from_be_bytes(head);
+            if id != 0 && !env.storage().persistent().has(&DataKey::Payment(id)) {
+                return id;
+            }
+            nonce += 1;
     fn with_reentrancy_guard<T>(
         env: &Env,
         f: impl FnOnce() -> Result<T, PaymentError>,
