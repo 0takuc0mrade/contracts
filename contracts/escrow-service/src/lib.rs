@@ -87,9 +87,13 @@ pub struct Dispute {
     /// Arbiter must rule by this time; afterwards the default applies.
     pub deadline: u64,
     /// Buyer share chosen by the arbiter or the default rule, once resolved.
-    pub buyer_bps: Option<u32>,
+    /// `UNRESOLVED` while the dispute is still open.
+    pub buyer_bps: u32,
     pub by_default: bool,
 }
+
+/// Sentinel for "arbiter has not ruled yet".
+const UNRESOLVED: u32 = u32::MAX;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -371,7 +375,7 @@ impl EscrowService {
                 reason,
                 raised_at: now,
                 deadline,
-                buyer_bps: None,
+                buyer_bps: UNRESOLVED,
                 by_default: false,
             },
         );
@@ -497,7 +501,7 @@ impl EscrowService {
         let remaining = escrow.remaining();
         let to_buyer = bps_of(remaining, buyer_bps).ok_or(EscrowError::InvalidSplit)?;
         let to_seller = remaining - to_buyer;
-        dispute.buyer_bps = Some(buyer_bps);
+        dispute.buyer_bps = buyer_bps;
         dispute.by_default = by_default;
         Self::save_dispute(env, escrow.id, &dispute);
         Self::payout(

@@ -19,7 +19,7 @@
 use shared::{extend_instance, extend_persistent, split_fee, MAX_FEE_BPS};
 use soroban_sdk::{
     contract, contractclient, contracterror, contractevent, contractimpl, contracttype, token,
-    Address, Env, Map, String, Vec,
+    Address, BytesN, Env, Map, String, Vec,
 };
 
 pub const MAX_ORDER_REF_LEN: u32 = 64;
@@ -81,9 +81,11 @@ pub struct Payment {
     pub fee: i128,
     pub refunded: i128,
     pub order_ref: String,
+    pub category: String,
     pub loyalty_points: u64,
     pub status: PaymentStatus,
     pub created_at: u64,
+    pub chain_id: BytesN<32>,
 }
 
 /// One line of a batch payment.
@@ -93,6 +95,7 @@ pub struct BatchLine {
     pub merchant: Address,
     pub amount: i128,
     pub order_ref: String,
+    pub category: String,
 }
 
 #[contracttype]
@@ -102,7 +105,6 @@ pub struct Config {
     pub registry: Address,
     pub treasury: Address,
     pub fee_bps: u32,
-    pub loyalty: Option<Address>,
     pub paused: bool,
 }
 
@@ -113,6 +115,7 @@ enum DataKey {
     PaymentCount,
     Payment(u64),
     Order(Address, String),
+    Loyalty,
 }
 
 #[contractevent]
@@ -127,6 +130,8 @@ pub struct PaymentSettled {
     pub amount: i128,
     pub fee: i128,
     pub order_ref: String,
+    pub category: String,
+    pub chain_id: BytesN<32>,
 }
 
 #[contractevent]
@@ -179,7 +184,6 @@ impl PaymentProcessor {
             registry,
             treasury,
             fee_bps,
-            loyalty: None,
             paused: false,
         };
         env.storage().instance().set(&DataKey::Config, &config);
@@ -197,6 +201,7 @@ impl PaymentProcessor {
         asset: Address,
         amount: i128,
         order_ref: String,
+        category: String,
     ) -> Result<u64, PaymentError> {
         let config = Self::config(&env)?;
         if config.paused {
@@ -205,7 +210,7 @@ impl PaymentProcessor {
         payer.require_auth();
         let settlement = Self::settlement_for(&env, &config, &merchant, &asset)?;
         Self::settle(
-            &env, &config, &payer, merchant, settlement, &asset, amount, order_ref,
+            &env, &config, &payer, merchant, settlement, &asset, amount, order_ref, category,
         )
     }
 
@@ -250,6 +255,7 @@ impl PaymentProcessor {
                 &asset,
                 line.amount,
                 line.order_ref,
+                line.category,
             )?);
         }
         Ok(ids)
@@ -330,7 +336,14 @@ impl PaymentProcessor {
     /// Enables loyalty accrual through the given loyalty program contract.
     /// Pass `None` to switch accrual off.
     pub fn set_loyalty(env: Env, loyalty: Option<Address>) -> Result<(), PaymentError> {
-        Self::update(&env, |c| c.loyalty = loyalty)
+        let config = Self::config(&env)?;
+        config.admin.require_auth();
+        match loyalty {
+            Some(addr) => env.storage().instance().set(&DataKey::Loyalty, &addr),
+            None => env.storage().instance().remove(&DataKey::Loyalty),
+        }
+        extend_instance(&env);
+        Ok(())
     }
 
     pub fn pause(env: Env) -> Result<(), PaymentError> {
@@ -375,6 +388,10 @@ impl PaymentProcessor {
         Self::config(&env)
     }
 
+    pub fn get_loyalty(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Loyalty)
+    }
+
     /// Fee and net split for a prospective payment, for checkout previews.
     pub fn quote(env: Env, amount: i128) -> Result<(i128, i128), PaymentError> {
         if amount <= 0 {
@@ -412,6 +429,7 @@ impl PaymentProcessor {
         asset: &Address,
         amount: i128,
         order_ref: String,
+        category: String,
     ) -> Result<u64, PaymentError> {
         if amount <= 0 {
             return Err(PaymentError::InvalidAmount);
@@ -431,8 +449,8 @@ impl PaymentProcessor {
             token.transfer(payer, &config.treasury, &fee);
         }
 
-        let loyalty_points = match &config.loyalty {
-            Some(loyalty) => LoyaltyClient::new(env, loyalty).accrue(
+        let loyalty_points = match env.storage().instance().get::<_, Address>(&DataKey::Loyalty) {
+            Some(loyalty) => LoyaltyClient::new(env, &loyalty).accrue(
                 &env.current_contract_address(),
                 &merchant,
                 payer,
@@ -452,9 +470,11 @@ impl PaymentProcessor {
             fee,
             refunded: 0,
             order_ref: order_ref.clone(),
+            category: category.clone(),
             loyalty_points,
             status: PaymentStatus::Completed,
             created_at: env.ledger().timestamp(),
+            chain_id: env.ledger().network_id(),
         };
         Self::save(env, &payment);
         env.storage().persistent().set(&order_key, &id);
@@ -470,6 +490,8 @@ impl PaymentProcessor {
             amount,
             fee,
             order_ref,
+            category,
+            chain_id: env.ledger().network_id(),
         }
         .publish(env);
         Ok(id)
