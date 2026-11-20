@@ -11,7 +11,8 @@
 //! Any single signer can `freeze` the treasury immediately (an emergency
 //! brake for a suspected key compromise); thawing needs the full threshold.
 //! Proposals expire after `PROPOSAL_TTL_SECS` so stale approvals cannot be
-//! executed months later.
+//! executed months later. Removing a signer cancels the open proposals that
+//! signer made, so a revoked key cannot leave queued actions behind.
 
 #![no_std]
 
@@ -300,6 +301,7 @@ impl Treasury {
                     return Err(TreasuryError::InvalidThreshold);
                 }
                 env.storage().instance().set(&DataKey::Signers, &next);
+                Self::cancel_open_by(&env, &signer, id);
             }
             Action::SetThreshold(t) => {
                 if t == 0 || t > signers.len() {
@@ -473,6 +475,35 @@ impl Treasury {
             return Err(TreasuryError::ProposalExpired);
         }
         Ok(proposal)
+    }
+
+    /// Cancels every open proposal made by `proposer`, except `skip` (the
+    /// one being executed). Only proposals younger than `PROPOSAL_TTL_SECS`
+    /// can still be open and IDs grow with time, so the scan walks back from
+    /// the newest and stops at the first expired one.
+    fn cancel_open_by(env: &Env, proposer: &Address, skip: u64) {
+        let now = env.ledger().timestamp();
+        let mut id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalCount)
+            .unwrap_or(0);
+        while id > 0 {
+            let Ok(mut proposal) = Self::load(env, id) else {
+                break;
+            };
+            if proposal.expires_at < now {
+                break;
+            }
+            if id != skip
+                && proposal.status == ProposalStatus::Open
+                && proposal.proposer == *proposer
+            {
+                proposal.status = ProposalStatus::Cancelled;
+                Self::save(env, &proposal);
+            }
+            id -= 1;
+        }
     }
 
     fn load(env: &Env, id: u64) -> Result<Proposal, TreasuryError> {
