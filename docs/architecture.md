@@ -64,7 +64,7 @@ check cheap.
 | Key | Storage | Value |
 |---|---|---|
 | `Config` | instance | `admin, registry, treasury, fee_bps, loyalty, paused` |
-| `PaymentCount` | instance | last payment id |
+| `PaymentCount` | instance | number of payments settled |
 | `Payment(id)` | persistent | full payment record |
 | `Order(merchant, order_ref)` | persistent | payment id (the idempotency index) |
 
@@ -79,6 +79,20 @@ absorbs it. That is standard card-network behavior, and it stops refunds
 being used to drain the treasury.
 
 **Status:** `Completed`, then `PartiallyRefunded`, then `Refunded`.
+
+**Payment IDs** are the first 8 bytes of a SHA-256 over the merchant, order
+reference, payer, payment count and ledger sequence, so the next ID cannot be
+predicted from a counter.
+
+**Transfers are verified.** After each transfer the recipient's balance must
+have risen by exactly the amount sent, otherwise the call reverts with
+`TransferFailed`. A token that reports success without moving funds, or that
+skims a fee, cannot settle a payment or a refund.
+
+**Compliance records.** Every sale and refund emits a `ComplianceRecord`
+under the `compliance` topic (plus `kind` and `merchant` topics) carrying the
+payment id, payer, settlement account, asset, amount, fee, order reference and
+ledger timestamp, so a reporting tool needs one subscription for all of them.
 
 ## loyalty-program
 
@@ -112,7 +126,7 @@ Every change is a proposal:
 |---|---|
 | `Withdraw(token, to, amount)` | Pays out. Blocked while frozen. |
 | `AddSigner(addr)` | Max 10 signers, no duplicates |
-| `RemoveSigner(addr)` | Rejected if signers would drop below threshold |
+| `RemoveSigner(addr)` | Rejected if signers would drop below threshold. Cancels every open proposal the removed signer made. |
 | `SetThreshold(n)` | `1 <= n <= signers` |
 | `Unfreeze` | Clears an emergency freeze |
 | `ApproveVault(vault)` / `RevokeVault(vault)` | Allows (up to 5) or stops deposits into a yield vault |
