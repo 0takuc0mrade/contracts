@@ -11,12 +11,21 @@
 //!    never holds customer funds.
 //! 4. Optionally accrues loyalty points for the payer.
 //!
+//! Marketplace integrations can settle with `pay_with_royalties`, which also
+//! pays royalty recipients a share of the net amount (after the platform fee),
+//! with the remainder going to the seller's settlement account.
+//!
+//! Critical parameters (fee rate, treasury) are changed by the admin until
+//! `enable_governance` hands them to an on-chain council: from then on they
+//! only change through `propose_param_change` / `approve_param_change` once
+//! enough council members approve.
+//!
 //! Refunds are pushed by the merchant's settlement account (which received
 //! the funds) back to the original payer, up to the gross amount paid.
 
 #![no_std]
 
-use shared::{extend_instance, extend_persistent, split_fee, MAX_FEE_BPS};
+use shared::{bps_of, extend_instance, extend_persistent, split_fee, BPS_DENOMINATOR, MAX_FEE_BPS};
 use soroban_sdk::{
     contract, contractclient, contracterror, contractevent, contractimpl, contracttype, token,
     Address, Env, Map, String, Vec,
@@ -25,6 +34,10 @@ use soroban_sdk::{
 pub const MAX_ORDER_REF_LEN: u32 = 64;
 /// Most payments in one pay_batch call, to stay well inside resource limits.
 pub const MAX_BATCH: u32 = 20;
+/// Most royalty recipients on one payment.
+pub const MAX_ROYALTY_RECIPIENTS: u32 = 5;
+/// Largest governance council.
+pub const MAX_COUNCIL: u32 = 10;
 
 /// The subset of the merchant registry this contract calls.
 #[allow(dead_code)]
@@ -58,6 +71,13 @@ pub enum PaymentError {
     AlreadyRefunded = 11,
     Overflow = 12,
     InvalidBatch = 13,
+    InvalidRoyaltySplit = 14,
+    GovernanceActive = 15,
+    InvalidGovernance = 16,
+    NotCouncilMember = 17,
+    ProposalNotFound = 18,
+    ProposalExecuted = 19,
+    AlreadyApproved = 20,
 }
 
 #[contracttype]
@@ -95,6 +115,39 @@ pub struct BatchLine {
     pub order_ref: String,
 }
 
+/// One royalty recipient and its share of the net amount, in basis points.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoyaltyShare {
+    pub recipient: Address,
+    pub bps: u32,
+}
+
+/// The council that controls critical parameters once governance is enabled.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Governance {
+    pub council: Vec<Address>,
+    /// Approvals needed to apply a change.
+    pub threshold: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParamChange {
+    FeeBps(u32),
+    Treasury(Address),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParamProposal {
+    pub id: u64,
+    pub change: ParamChange,
+    pub approvals: Vec<Address>,
+    pub executed: bool,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
@@ -113,6 +166,9 @@ enum DataKey {
     PaymentCount,
     Payment(u64),
     Order(Address, String),
+    Governance,
+    ProposalCount,
+    Proposal(u64),
 }
 
 #[contractevent]
@@ -139,6 +195,33 @@ pub struct PaymentRefunded {
     pub amount: i128,
     pub total_refunded: i128,
     pub reason: String,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoyaltyPaid {
+    #[topic]
+    pub payment_id: u64,
+    #[topic]
+    pub recipient: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParamChangeProposed {
+    #[topic]
+    pub proposal_id: u64,
+    pub proposer: Address,
+    pub change: ParamChange,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParamChangeApplied {
+    #[topic]
+    pub proposal_id: u64,
+    pub change: ParamChange,
 }
 
 #[contractevent]
@@ -205,7 +288,53 @@ impl PaymentProcessor {
         payer.require_auth();
         let settlement = Self::settlement_for(&env, &config, &merchant, &asset)?;
         Self::settle(
-            &env, &config, &payer, merchant, settlement, &asset, amount, order_ref,
+            &env,
+            &config,
+            &payer,
+            merchant,
+            settlement,
+            &asset,
+            amount,
+            order_ref,
+            &Vec::new(&env),
+        )
+    }
+
+    /// Settles a marketplace sale with a multi-party split: the platform fee
+    /// goes to the treasury, each royalty recipient gets its `bps` share of
+    /// the net amount, and the seller's settlement account gets the rest.
+    /// Shares must be non-zero and add up to at most 100%. Like the platform
+    /// fee, royalties are not clawed back on refunds.
+    pub fn pay_with_royalties(
+        env: Env,
+        payer: Address,
+        merchant: Address,
+        asset: Address,
+        amount: i128,
+        order_ref: String,
+        royalties: Vec<RoyaltyShare>,
+    ) -> Result<u64, PaymentError> {
+        let config = Self::config(&env)?;
+        if config.paused {
+            return Err(PaymentError::Paused);
+        }
+        if royalties.len() > MAX_ROYALTY_RECIPIENTS {
+            return Err(PaymentError::InvalidRoyaltySplit);
+        }
+        let mut total_bps: u32 = 0;
+        for share in royalties.iter() {
+            if share.bps == 0 {
+                return Err(PaymentError::InvalidRoyaltySplit);
+            }
+            total_bps = total_bps.saturating_add(share.bps);
+        }
+        if total_bps > BPS_DENOMINATOR {
+            return Err(PaymentError::InvalidRoyaltySplit);
+        }
+        payer.require_auth();
+        let settlement = Self::settlement_for(&env, &config, &merchant, &asset)?;
+        Self::settle(
+            &env, &config, &payer, merchant, settlement, &asset, amount, order_ref, &royalties,
         )
     }
 
@@ -250,6 +379,7 @@ impl PaymentProcessor {
                 &asset,
                 line.amount,
                 line.order_ref,
+                &Vec::new(&env),
             )?);
         }
         Ok(ids)
@@ -310,21 +440,124 @@ impl PaymentProcessor {
     // Admin
     // ---------------------------------------------------------------------
 
+    /// Admin-only until governance is enabled; then use `propose_param_change`.
     pub fn set_fee_bps(env: Env, fee_bps: u32) -> Result<(), PaymentError> {
+        Self::require_no_governance(&env)?;
         if fee_bps > MAX_FEE_BPS {
             return Err(PaymentError::InvalidFeeRate);
         }
         Self::update(&env, |c| c.fee_bps = fee_bps)
     }
 
-    pub fn set_fee_recipient(env: Env, recipient: Address) -> Result<(), PaymentError> {
-        let mut config = Self::config(&env)?;
-        config.admin.require_auth();
-        Self::update(&env, |c| c.treasury = recipient)
+    /// Admin-only until governance is enabled; then use `propose_param_change`.
+    pub fn set_treasury(env: Env, treasury: Address) -> Result<(), PaymentError> {
+        Self::require_no_governance(&env)?;
+        Self::update(&env, |c| c.treasury = treasury)
     }
 
-    pub fn set_treasury(env: Env, treasury: Address) -> Result<(), PaymentError> {
-        Self::update(&env, |c| c.treasury = treasury)
+    // ---------------------------------------------------------------------
+    // Governance
+    // ---------------------------------------------------------------------
+
+    /// Hands control of the fee rate and treasury to a council. One-way: the
+    /// admin can no longer change those parameters on its own afterwards.
+    pub fn enable_governance(
+        env: Env,
+        council: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), PaymentError> {
+        let config = Self::config(&env)?;
+        config.admin.require_auth();
+        Self::require_no_governance(&env)?;
+        if council.is_empty()
+            || council.len() > MAX_COUNCIL
+            || threshold == 0
+            || threshold > council.len()
+        {
+            return Err(PaymentError::InvalidGovernance);
+        }
+        for (i, member) in council.iter().enumerate() {
+            if council.first_index_of(&member) != Some(i as u32) {
+                return Err(PaymentError::InvalidGovernance);
+            }
+        }
+        let gov = Governance { council, threshold };
+        env.storage().instance().set(&DataKey::Governance, &gov);
+        extend_instance(&env);
+        Ok(())
+    }
+
+    /// A council member proposes a parameter change; the proposer's approval
+    /// is counted, so a threshold of 1 applies it immediately.
+    pub fn propose_param_change(
+        env: Env,
+        proposer: Address,
+        change: ParamChange,
+    ) -> Result<u64, PaymentError> {
+        let gov = Self::governance(&env)?;
+        Self::require_member(&gov, &proposer)?;
+        if let ParamChange::FeeBps(bps) = change {
+            if bps > MAX_FEE_BPS {
+                return Err(PaymentError::InvalidFeeRate);
+            }
+        }
+        let id: u64 = env
+            .storage()
+            .instance()
+            .get::<_, u64>(&DataKey::ProposalCount)
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(PaymentError::Overflow)?;
+        env.storage().instance().set(&DataKey::ProposalCount, &id);
+        let mut proposal = ParamProposal {
+            id,
+            change: change.clone(),
+            approvals: Vec::from_array(&env, [proposer.clone()]),
+            executed: false,
+        };
+        ParamChangeProposed {
+            proposal_id: id,
+            proposer,
+            change,
+        }
+        .publish(&env);
+        Self::apply_if_ready(&env, &gov, &mut proposal)?;
+        Ok(id)
+    }
+
+    /// A council member approves a pending change. Returns `true` once the
+    /// change has been applied.
+    pub fn approve_param_change(
+        env: Env,
+        member: Address,
+        proposal_id: u64,
+    ) -> Result<bool, PaymentError> {
+        let gov = Self::governance(&env)?;
+        Self::require_member(&gov, &member)?;
+        let mut proposal = Self::get_param_proposal(env.clone(), proposal_id)?;
+        if proposal.executed {
+            return Err(PaymentError::ProposalExecuted);
+        }
+        if proposal.approvals.contains(&member) {
+            return Err(PaymentError::AlreadyApproved);
+        }
+        proposal.approvals.push_back(member);
+        Self::apply_if_ready(&env, &gov, &mut proposal)
+    }
+
+    pub fn get_governance(env: Env) -> Option<Governance> {
+        env.storage().instance().get(&DataKey::Governance)
+    }
+
+    pub fn get_param_proposal(env: Env, proposal_id: u64) -> Result<ParamProposal, PaymentError> {
+        let key = DataKey::Proposal(proposal_id);
+        let proposal = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(PaymentError::ProposalNotFound)?;
+        extend_persistent(&env, &key);
+        Ok(proposal)
     }
 
     /// Enables loyalty accrual through the given loyalty program contract.
@@ -412,6 +645,7 @@ impl PaymentProcessor {
         asset: &Address,
         amount: i128,
         order_ref: String,
+        royalties: &Vec<RoyaltyShare>,
     ) -> Result<u64, PaymentError> {
         if amount <= 0 {
             return Err(PaymentError::InvalidAmount);
@@ -425,8 +659,27 @@ impl PaymentProcessor {
         }
 
         let (fee, net) = split_fee(amount, config.fee_bps).ok_or(PaymentError::Overflow)?;
+        let id = Self::payment_count(env.clone())
+            .checked_add(1)
+            .ok_or(PaymentError::Overflow)?;
         let token = token::Client::new(env, asset);
-        token.transfer(payer, &settlement, &net);
+        let mut seller_net = net;
+        for share in royalties.iter() {
+            let cut = bps_of(net, share.bps).ok_or(PaymentError::Overflow)?;
+            if cut > 0 {
+                token.transfer(payer, &share.recipient, &cut);
+                seller_net -= cut;
+                RoyaltyPaid {
+                    payment_id: id,
+                    recipient: share.recipient,
+                    amount: cut,
+                }
+                .publish(env);
+            }
+        }
+        if seller_net > 0 {
+            token.transfer(payer, &settlement, &seller_net);
+        }
         if fee > 0 {
             token.transfer(payer, &config.treasury, &fee);
         }
@@ -441,7 +694,6 @@ impl PaymentProcessor {
             None => 0,
         };
 
-        let id = Self::payment_count(env.clone()).checked_add(1).ok_or(PaymentError::Overflow)?;
         let payment = Payment {
             id,
             payer: payer.clone(),
@@ -483,8 +735,17 @@ impl PaymentProcessor {
     }
 
     fn update(env: &Env, f: impl FnOnce(&mut Config)) -> Result<(), PaymentError> {
-        let mut config = Self::config(env)?;
+        let config = Self::config(env)?;
         config.admin.require_auth();
+        Self::store_config(env, config, f)
+    }
+
+    /// Applies `f` to the config and publishes the change. Callers check auth.
+    fn store_config(
+        env: &Env,
+        mut config: Config,
+        f: impl FnOnce(&mut Config),
+    ) -> Result<(), PaymentError> {
         f(&mut config);
         env.storage().instance().set(&DataKey::Config, &config);
         extend_instance(env);
@@ -495,6 +756,53 @@ impl PaymentProcessor {
         }
         .publish(env);
         Ok(())
+    }
+
+    fn governance(env: &Env) -> Result<Governance, PaymentError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Governance)
+            .ok_or(PaymentError::InvalidGovernance)
+    }
+
+    fn require_no_governance(env: &Env) -> Result<(), PaymentError> {
+        if env.storage().instance().has(&DataKey::Governance) {
+            return Err(PaymentError::GovernanceActive);
+        }
+        Ok(())
+    }
+
+    fn require_member(gov: &Governance, member: &Address) -> Result<(), PaymentError> {
+        if !gov.council.contains(member) {
+            return Err(PaymentError::NotCouncilMember);
+        }
+        member.require_auth();
+        Ok(())
+    }
+
+    /// Saves the proposal, applying its change first when it has enough approvals.
+    fn apply_if_ready(
+        env: &Env,
+        gov: &Governance,
+        proposal: &mut ParamProposal,
+    ) -> Result<bool, PaymentError> {
+        if proposal.approvals.len() >= gov.threshold {
+            let config = Self::config(env)?;
+            match proposal.change.clone() {
+                ParamChange::FeeBps(bps) => Self::store_config(env, config, |c| c.fee_bps = bps)?,
+                ParamChange::Treasury(t) => Self::store_config(env, config, |c| c.treasury = t)?,
+            }
+            proposal.executed = true;
+            ParamChangeApplied {
+                proposal_id: proposal.id,
+                change: proposal.change.clone(),
+            }
+            .publish(env);
+        }
+        let key = DataKey::Proposal(proposal.id);
+        env.storage().persistent().set(&key, proposal);
+        extend_persistent(env, &key);
+        Ok(proposal.executed)
     }
 
     fn load(env: &Env, id: u64) -> Result<Payment, PaymentError> {

@@ -20,7 +20,7 @@ This repository is one of three:
 | Crate | Purpose | Key entry points |
 |---|---|---|
 | [`merchant-registry`](contracts/merchant-registry/src/lib.rs) | Who may get paid, where funds settle, which assets each merchant takes | `register`, `approve`, `suspend`, `accepts`, `settlement_of` |
-| [`payment-processor`](contracts/payment-processor/src/lib.rs) | Atomic sale settlement: fee to treasury, net to merchant, one payment per order | `pay`, `pay_batch`, `refund`, `payment_for_order`, `quote` |
+| [`payment-processor`](contracts/payment-processor/src/lib.rs) | Atomic sale settlement: fee to treasury, net to merchant, one payment per order | `pay`, `pay_batch`, `pay_with_royalties`, `refund`, `payment_for_order`, `quote`, `propose_param_change` |
 | [`loyalty-program`](contracts/loyalty-program/src/lib.rs) | Per-merchant points with automatic Bronze/Silver/Gold/Platinum tiers | `enroll`, `accrue`, `redeem`, `get_account` |
 | [`treasury`](contracts/treasury/src/lib.rs) | M-of-N multisig that holds protocol fees and can put idle funds into approved yield vaults | `propose`, `approve`, `execute`, `freeze`, `vaults` |
 | [`escrow-service`](contracts/escrow-service/src/lib.rs) | Held payments for deliveries and pre-orders, with dispute resolution | `create`, `release`, `claim`, `raise_dispute`, `resolve`, `resolve_by_default` |
@@ -71,6 +71,32 @@ These hold across every contract:
 
 More detail on each contract, including state machines and storage layout, is
 in [docs/architecture.md](docs/architecture.md).
+
+## Glossary
+
+Point-of-sale terms used across the contracts and docs:
+
+| Term | Meaning |
+|---|---|
+| **Merchant** | A business registered in `merchant-registry`. Only approved, active merchants can be paid. |
+| **Settlement account** | The address a merchant's sales are paid into (can differ from the merchant's own address). Refunds are sent from it. |
+| **Order reference (`order_ref`)** | The POS order number. Each merchant can be paid once per order reference, so a double-tapped "Pay" never charges twice. |
+| **Settlement** | Completing a sale on-chain: the fee goes to the treasury and the net goes to the settlement account, in one transaction. |
+| **Gross / net amount** | Gross is what the customer pays; net is what remains after the protocol fee. |
+| **Basis points (bps)** | Hundredths of a percent: 100 bps = 1%, 10,000 bps = 100%. Fees and splits are set in bps. |
+| **Protocol fee (`fee_bps`)** | The platform's cut of each sale, capped at 10% (`MAX_FEE_BPS`), paid to the treasury. |
+| **Royalty split** | Extra recipients (artists, referrers) paid a bps share of the net amount on a marketplace sale; the seller gets the rest. |
+| **Quote** | A preview of the fee/net split for an amount, shown at checkout before paying. |
+| **Batch payment** | Several orders paid by one customer in one all-or-nothing transaction (`pay_batch`). |
+| **Refund (partial / full)** | Money sent back from the settlement account to the payer, up to the gross amount. Fees and royalties are not returned. |
+| **Treasury** | The M-of-N multisig contract that holds protocol fees. |
+| **Escrow** | A payment held by the contract until delivery: released by the buyer or claimable by the seller after `release_at`. |
+| **Release time (`release_at`)** | When escrowed funds become claimable by the seller; buyers can open a dispute until then. |
+| **Dispute / arbitration window** | A dispute freezes an escrow; the arbiter must rule within the arbitration window or a default rule resolves it. |
+| **Payment stream** | Money paid per second (subscriptions, rent, payroll); cancelling splits earned and unearned amounts exactly. |
+| **Loyalty tier** | Bronze, Silver, Gold or Platinum: a customer's level with a merchant, which boosts points earned. |
+| **Governance council** | Once enabled, the members who must approve fee-rate and treasury changes instead of the admin alone. |
+| **TTL / bump** | Soroban storage expires unless extended; contracts bump records whenever they are read or written. |
 
 ## Getting started
 
