@@ -359,3 +359,180 @@ fn batch_size_limits_and_pause() {
         Err(Ok(PaymentError::Paused))
     );
 }
+
+#[test]
+fn split_payment_distributes_across_contributors() {
+    let s = setup(200); // 2% fee
+    let payer2 = Address::generate(&s.env);
+    let payer3 = Address::generate(&s.env);
+    StellarAssetClient::new(&s.env, &s.asset).mint(&payer2, &(500 * UNIT));
+    StellarAssetClient::new(&s.env, &s.asset).mint(&payer3, &(500 * UNIT));
+
+    let shares = vec![
+        &s.env,
+        SplitShare {
+            payer: s.payer.clone(),
+            amount: 50 * UNIT,
+        },
+        SplitShare {
+            payer: payer2.clone(),
+            amount: 30 * UNIT,
+        },
+        SplitShare {
+            payer: payer3.clone(),
+            amount: 20 * UNIT,
+        },
+    ];
+
+    let id =
+        s.pp.split_payment(&s.merchant, &s.asset, &shares, &order(&s.env, "GRP-1"));
+    assert_eq!(id, 1);
+
+    assert_eq!(s.token.balance(&s.payer), 950 * UNIT);
+    assert_eq!(s.token.balance(&payer2), 470 * UNIT);
+    assert_eq!(s.token.balance(&payer3), 480 * UNIT);
+    assert_eq!(s.token.balance(&s.settlement), 98 * UNIT);
+    assert_eq!(s.token.balance(&s.treasury), 2 * UNIT);
+    assert_eq!(s.token.balance(&s.pp.address), 0);
+
+    let p = s.pp.get_payment(&id);
+    assert_eq!(p.amount, 100 * UNIT);
+    assert_eq!(p.fee, 2 * UNIT);
+    assert_eq!(p.status, PaymentStatus::Completed);
+
+    // Duplicate order ref is rejected
+    assert_eq!(
+        s.pp.try_split_payment(&s.merchant, &s.asset, &shares, &order(&s.env, "GRP-1")),
+        Err(Ok(PaymentError::DuplicateOrder))
+    );
+    // Empty shares rejected
+    assert_eq!(
+        s.pp.try_split_payment(
+            &s.merchant,
+            &s.asset,
+            &vec![&s.env],
+            &order(&s.env, "GRP-2")
+        ),
+        Err(Ok(PaymentError::InvalidSplit))
+    );
+    // Non-positive share rejected
+    assert_eq!(
+        s.pp.try_split_payment(
+            &s.merchant,
+            &s.asset,
+            &vec![
+                &s.env,
+                SplitShare {
+                    payer: s.payer.clone(),
+                    amount: 0
+                }
+            ],
+            &order(&s.env, "GRP-3"),
+        ),
+        Err(Ok(PaymentError::InvalidAmount))
+    );
+}
+
+#[contract]
+struct MaliciousCallback;
+
+#[contracttype]
+enum CallbackKey {
+    Target,
+    ReentryBlocked,
+}
+
+#[contractimpl]
+impl MaliciousCallback {
+    pub fn init(env: Env, target: Address) {
+        env.storage().instance().set(&CallbackKey::Target, &target);
+        env.storage()
+            .instance()
+            .set(&CallbackKey::ReentryBlocked, &false);
+    }
+
+    pub fn on_payment_settled(
+        env: Env,
+        _payment_id: u64,
+        merchant: Address,
+        payer: Address,
+        asset: Address,
+        amount: i128,
+    ) {
+        let target: Address = env.storage().instance().get(&CallbackKey::Target).unwrap();
+        let res = PaymentProcessorClient::new(&env, &target).try_pay(
+            &payer,
+            &merchant,
+            &asset,
+            &amount,
+            &String::from_str(&env, "REENTER"),
+        );
+        if res.is_err() {
+            env.storage()
+                .instance()
+                .set(&CallbackKey::ReentryBlocked, &true);
+        }
+    }
+
+    pub fn reentry_blocked(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&CallbackKey::ReentryBlocked)
+            .unwrap_or(false)
+    }
+}
+
+#[test]
+fn reentrancy_via_merchant_callback_is_blocked() {
+    let s = setup(100);
+    let cb_id = s.env.register(MaliciousCallback, ());
+    let cb = MaliciousCallbackClient::new(&s.env, &cb_id);
+    cb.init(&s.pp.address);
+
+    s.pp.set_merchant_callback(&s.merchant, &Some(cb_id.clone()));
+    assert_eq!(s.pp.get_merchant_callback(&s.merchant), Some(cb_id));
+
+    let id = s.pp.pay(
+        &s.payer,
+        &s.merchant,
+        &s.asset,
+        &(10 * UNIT),
+        &order(&s.env, "ORD-CB-1"),
+    );
+    assert_eq!(id, 1);
+    assert!(cb.reentry_blocked());
+    // Re-entrant payment was never recorded
+    assert_eq!(s.pp.payment_count(), 1);
+
+    // Lock is released after completion, so a subsequent payment succeeds
+    let id2 = s.pp.pay(
+        &s.payer,
+        &s.merchant,
+        &s.asset,
+        &(10 * UNIT),
+        &order(&s.env, "ORD-CB-2"),
+    );
+    assert_eq!(id2, 2);
+
+    // Explicit reentrancy lock rejects pay, split_payment, and refund
+    s.env.as_contract(&s.pp.address, || {
+        s.env
+            .storage()
+            .instance()
+            .set(&DataKey::ReentrancyLock, &true);
+    });
+    assert_eq!(
+        s.pp.try_pay(
+            &s.payer,
+            &s.merchant,
+            &s.asset,
+            &UNIT,
+            &order(&s.env, "LOCKED"),
+        ),
+        Err(Ok(PaymentError::Reentrancy))
+    );
+    assert_eq!(
+        s.pp.try_refund(&id, &UNIT, &order(&s.env, "LOCKED")),
+        Err(Ok(PaymentError::Reentrancy))
+    );
+}
