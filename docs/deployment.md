@@ -37,7 +37,13 @@ Anyone can run this against a published manifest to check that a
 deployment runs this source, which is useful before an audit or before
 trusting a mainnet deployment.
 
-## 2. Harden the treasury
+## 2. Harden the treasury and admin
+
+> **Production requirement:** Never leave a single-key deployer EOA as the
+> `admin` of `payment-processor`, `merchant-registry`, `loyalty-program`,
+> `escrow-service`, or `payment-stream` on mainnet. Initialize production
+> contracts with a multisig contract (such as the hardened `treasury` M-of-N
+> multisig) or a Stellar M-of-N multisig account as `admin`.
 
 Before the treasury holds real fees, turn the 1-of-1 deployer setup into a
 real multisig:
