@@ -30,6 +30,8 @@ use soroban_sdk::{
 pub const MAX_ORDER_REF_LEN: u32 = 64;
 /// Most payments in one pay_batch call, to stay well inside resource limits.
 pub const MAX_BATCH: u32 = 20;
+/// Most contributing buyers in one split_payment call.
+pub const MAX_SPLITS: u32 = 20;
 
 /// The subset of the merchant registry this contract calls.
 #[allow(dead_code)]
@@ -44,6 +46,20 @@ pub trait RegistryInterface {
 pub trait LoyaltyInterface {
     fn accrue(env: Env, caller: Address, merchant: Address, customer: Address, amount: i128)
         -> u64;
+}
+
+/// Optional merchant callback invoked after a payment settles.
+#[allow(dead_code)]
+#[contractclient(name = "MerchantCallbackClient")]
+pub trait MerchantCallbackInterface {
+    fn on_payment_settled(
+        env: Env,
+        payment_id: u64,
+        merchant: Address,
+        payer: Address,
+        asset: Address,
+        amount: i128,
+    );
 }
 
 #[contracterror]
@@ -65,6 +81,8 @@ pub enum PaymentError {
     InvalidBatch = 13,
     /// The token did not credit the recipient with the amount transferred.
     TransferFailed = 14,
+    InvalidSplit = 14,
+    Reentrancy = 15,
 }
 
 #[contracttype]
@@ -102,6 +120,14 @@ pub struct BatchLine {
     pub order_ref: String,
 }
 
+/// One buyer's contribution in a group split payment.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SplitShare {
+    pub payer: Address,
+    pub amount: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
@@ -120,6 +146,8 @@ enum DataKey {
     PaymentCount,
     Payment(u64),
     Order(Address, String),
+    MerchantCallback(Address),
+    ReentrancyLock,
 }
 
 #[contractevent]
@@ -133,6 +161,20 @@ pub struct PaymentSettled {
     pub asset: Address,
     pub amount: i128,
     pub fee: i128,
+    pub order_ref: String,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentSplit {
+    #[topic]
+    pub merchant: Address,
+    #[topic]
+    pub payment_id: u64,
+    pub asset: Address,
+    pub total_amount: i128,
+    pub fee: i128,
+    pub contributors: u32,
     pub order_ref: String,
 }
 
@@ -226,15 +268,127 @@ impl PaymentProcessor {
         amount: i128,
         order_ref: String,
     ) -> Result<u64, PaymentError> {
-        let config = Self::config(&env)?;
-        if config.paused {
-            return Err(PaymentError::Paused);
-        }
-        payer.require_auth();
-        let settlement = Self::settlement_for(&env, &config, &merchant, &asset)?;
-        Self::settle(
-            &env, &config, &payer, merchant, settlement, &asset, amount, order_ref,
-        )
+        Self::with_reentrancy_guard(&env, || {
+            let config = Self::config(&env)?;
+            if config.paused {
+                return Err(PaymentError::Paused);
+            }
+            payer.require_auth();
+            let settlement = Self::settlement_for(&env, &config, &merchant, &asset)?;
+            Self::settle(
+                &env, &config, &payer, merchant, settlement, &asset, amount, order_ref,
+            )
+        })
+    }
+
+    /// Settles a group purchase by splitting a single payment across multiple
+    /// contributing buyers. Every contributor authorizes their share; all
+    /// transfers settle atomically or none do.
+    pub fn split_payment(
+        env: Env,
+        merchant: Address,
+        asset: Address,
+        shares: Vec<SplitShare>,
+        order_ref: String,
+    ) -> Result<u64, PaymentError> {
+        Self::with_reentrancy_guard(&env, || {
+            let config = Self::config(&env)?;
+            if config.paused {
+                return Err(PaymentError::Paused);
+            }
+            if shares.is_empty() || shares.len() > MAX_SPLITS {
+                return Err(PaymentError::InvalidSplit);
+            }
+            if order_ref.is_empty() || order_ref.len() > MAX_ORDER_REF_LEN {
+                return Err(PaymentError::InvalidOrderRef);
+            }
+            let order_key = DataKey::Order(merchant.clone(), order_ref.clone());
+            if env.storage().persistent().has(&order_key) {
+                return Err(PaymentError::DuplicateOrder);
+            }
+
+            let settlement = Self::settlement_for(&env, &config, &merchant, &asset)?;
+
+            let mut total_amount: i128 = 0;
+            for share in shares.iter() {
+                if share.amount <= 0 {
+                    return Err(PaymentError::InvalidAmount);
+                }
+                total_amount = total_amount
+                    .checked_add(share.amount)
+                    .ok_or(PaymentError::Overflow)?;
+                share.payer.require_auth();
+            }
+
+            let token = token::Client::new(&env, &asset);
+            let mut total_fee: i128 = 0;
+            let mut total_loyalty: u64 = 0;
+            for share in shares.iter() {
+                let (fee, net) =
+                    split_fee(share.amount, config.fee_bps).ok_or(PaymentError::Overflow)?;
+                token.transfer(&share.payer, &settlement, &net);
+                if fee > 0 {
+                    token.transfer(&share.payer, &config.treasury, &fee);
+                }
+                total_fee = total_fee.checked_add(fee).ok_or(PaymentError::Overflow)?;
+                if let Some(loyalty) = &config.loyalty {
+                    let pts = LoyaltyClient::new(&env, loyalty).accrue(
+                        &env.current_contract_address(),
+                        &merchant,
+                        &share.payer,
+                        &share.amount,
+                    );
+                    total_loyalty = total_loyalty
+                        .checked_add(pts)
+                        .ok_or(PaymentError::Overflow)?;
+                }
+            }
+
+            let primary_payer = shares.get(0).ok_or(PaymentError::InvalidSplit)?.payer;
+            let id = Self::payment_count(env.clone())
+                .checked_add(1)
+                .ok_or(PaymentError::Overflow)?;
+            let payment = Payment {
+                id,
+                payer: primary_payer.clone(),
+                merchant: merchant.clone(),
+                settlement,
+                asset: asset.clone(),
+                amount: total_amount,
+                fee: total_fee,
+                refunded: 0,
+                order_ref: order_ref.clone(),
+                loyalty_points: total_loyalty,
+                status: PaymentStatus::Completed,
+                created_at: env.ledger().timestamp(),
+            };
+            Self::save(&env, &payment);
+            env.storage().persistent().set(&order_key, &id);
+            extend_persistent(&env, &order_key);
+            env.storage().instance().set(&DataKey::PaymentCount, &id);
+            extend_instance(&env);
+
+            PaymentSplit {
+                merchant: merchant.clone(),
+                payment_id: id,
+                asset: asset.clone(),
+                total_amount,
+                fee: total_fee,
+                contributors: shares.len(),
+                order_ref,
+            }
+            .publish(&env);
+
+            Self::invoke_merchant_callback(
+                &env,
+                id,
+                &merchant,
+                &primary_payer,
+                &asset,
+                total_amount,
+            );
+            Ok(id)
+        })
     }
 
     /// Settles several payments from one payer in a single transaction: a
@@ -248,39 +402,41 @@ impl PaymentProcessor {
         asset: Address,
         lines: Vec<BatchLine>,
     ) -> Result<Vec<u64>, PaymentError> {
-        let config = Self::config(&env)?;
-        if config.paused {
-            return Err(PaymentError::Paused);
-        }
-        if lines.is_empty() || lines.len() > MAX_BATCH {
-            return Err(PaymentError::InvalidBatch);
-        }
-        payer.require_auth();
+        Self::with_reentrancy_guard(&env, || {
+            let config = Self::config(&env)?;
+            if config.paused {
+                return Err(PaymentError::Paused);
+            }
+            if lines.is_empty() || lines.len() > MAX_BATCH {
+                return Err(PaymentError::InvalidBatch);
+            }
+            payer.require_auth();
 
-        // Look each merchant up once, however many lines it has.
-        let mut targets: Map<Address, Address> = Map::new(&env);
-        let mut ids = Vec::new(&env);
-        for line in lines.iter() {
-            let settlement = match targets.get(line.merchant.clone()) {
-                Some(s) => s,
-                None => {
-                    let s = Self::settlement_for(&env, &config, &line.merchant, &asset)?;
-                    targets.set(line.merchant.clone(), s.clone());
-                    s
-                }
-            };
-            ids.push_back(Self::settle(
-                &env,
-                &config,
-                &payer,
-                line.merchant,
-                settlement,
-                &asset,
-                line.amount,
-                line.order_ref,
-            )?);
-        }
-        Ok(ids)
+            // Look each merchant up once, however many lines it has.
+            let mut targets: Map<Address, Address> = Map::new(&env);
+            let mut ids = Vec::new(&env);
+            for line in lines.iter() {
+                let settlement = match targets.get(line.merchant.clone()) {
+                    Some(s) => s,
+                    None => {
+                        let s = Self::settlement_for(&env, &config, &line.merchant, &asset)?;
+                        targets.set(line.merchant.clone(), s.clone());
+                        s
+                    }
+                };
+                ids.push_back(Self::settle(
+                    &env,
+                    &config,
+                    &payer,
+                    line.merchant,
+                    settlement,
+                    &asset,
+                    line.amount,
+                    line.order_ref,
+                )?);
+            }
+            Ok(ids)
+        })
     }
 
     /// Refunds part or all of a payment from the merchant's settlement
@@ -292,22 +448,49 @@ impl PaymentProcessor {
         amount: i128,
         reason: String,
     ) -> Result<i128, PaymentError> {
-        let mut payment = Self::load(&env, payment_id)?;
-        payment.settlement.require_auth();
+        Self::with_reentrancy_guard(&env, || {
+            let mut payment = Self::load(&env, payment_id)?;
+            payment.settlement.require_auth();
 
-        if amount <= 0 {
-            return Err(PaymentError::InvalidAmount);
-        }
-        if payment.status == PaymentStatus::Refunded {
-            return Err(PaymentError::AlreadyRefunded);
-        }
-        let total = payment
-            .refunded
-            .checked_add(amount)
-            .ok_or(PaymentError::Overflow)?;
-        if total > payment.amount {
-            return Err(PaymentError::RefundExceedsPayment);
-        }
+            if amount <= 0 {
+                return Err(PaymentError::InvalidAmount);
+            }
+            if payment.status == PaymentStatus::Refunded {
+                return Err(PaymentError::AlreadyRefunded);
+            }
+            let total = payment
+                .refunded
+                .checked_add(amount)
+                .ok_or(PaymentError::Overflow)?;
+            if total > payment.amount {
+                return Err(PaymentError::RefundExceedsPayment);
+            }
+
+            token::Client::new(&env, &payment.asset).transfer(
+                &payment.settlement,
+                &payment.payer,
+                &amount,
+            );
+
+            payment.refunded = total;
+            payment.status = if total == payment.amount {
+                PaymentStatus::Refunded
+            } else {
+                PaymentStatus::PartiallyRefunded
+            };
+            Self::save(&env, &payment);
+
+            PaymentRefunded {
+                merchant: payment.merchant,
+                payment_id,
+                amount,
+                total_refunded: total,
+                reason,
+            }
+            .publish(&env);
+            Ok(total)
+        })
+    }
 
         let client = token::Client::new(&env, &payment.asset);
         Self::transfer_checked(&client, &payment.settlement, &payment.payer, amount)?;
@@ -339,9 +522,34 @@ impl PaymentProcessor {
             amount,
             total_refunded: total,
             reason,
+    /// Registers or clears a post-settlement callback contract for `merchant`.
+    pub fn set_merchant_callback(
+        env: Env,
+        merchant: Address,
+        callback: Option<Address>,
+    ) -> Result<(), PaymentError> {
+        Self::config(&env)?;
+        merchant.require_auth();
+        let key = DataKey::MerchantCallback(merchant);
+        match callback {
+            Some(addr) => {
+                env.storage().persistent().set(&key, &addr);
+                extend_persistent(&env, &key);
+            }
+            None => {
+                env.storage().persistent().remove(&key);
+            }
         }
-        .publish(&env);
-        Ok(total)
+        Ok(())
+    }
+
+    pub fn get_merchant_callback(env: Env, merchant: Address) -> Option<Address> {
+        let key = DataKey::MerchantCallback(merchant);
+        let addr = env.storage().persistent().get(&key);
+        if addr.is_some() {
+            extend_persistent(&env, &key);
+        }
+        addr
     }
 
     // ---------------------------------------------------------------------
@@ -483,6 +691,9 @@ impl PaymentProcessor {
             .checked_add(1)
             .ok_or(PaymentError::Overflow)?;
         let id = Self::new_payment_id(env, payer, &merchant, &order_ref, count);
+        let id = Self::payment_count(env.clone())
+            .checked_add(1)
+            .ok_or(PaymentError::Overflow)?;
         let payment = Payment {
             id,
             payer: payer.clone(),
@@ -517,7 +728,7 @@ impl PaymentProcessor {
         }
         .publish(env);
         PaymentSettled {
-            merchant,
+            merchant: merchant.clone(),
             payment_id: id,
             payer: payer.clone(),
             asset: asset.clone(),
@@ -526,6 +737,8 @@ impl PaymentProcessor {
             order_ref,
         }
         .publish(env);
+
+        Self::invoke_merchant_callback(env, id, &merchant, payer, asset, amount);
         Ok(id)
     }
 
@@ -581,6 +794,46 @@ impl PaymentProcessor {
                 return id;
             }
             nonce += 1;
+    fn with_reentrancy_guard<T>(
+        env: &Env,
+        f: impl FnOnce() -> Result<T, PaymentError>,
+    ) -> Result<T, PaymentError> {
+        if env
+            .storage()
+            .instance()
+            .get(&DataKey::ReentrancyLock)
+            .unwrap_or(false)
+        {
+            return Err(PaymentError::Reentrancy);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentrancyLock, &true);
+        let result = f();
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentrancyLock, &false);
+        result
+    }
+
+    fn invoke_merchant_callback(
+        env: &Env,
+        payment_id: u64,
+        merchant: &Address,
+        payer: &Address,
+        asset: &Address,
+        amount: i128,
+    ) {
+        let key = DataKey::MerchantCallback(merchant.clone());
+        if let Some(callback) = env.storage().persistent().get::<DataKey, Address>(&key) {
+            extend_persistent(env, &key);
+            MerchantCallbackClient::new(env, &callback).on_payment_settled(
+                &payment_id,
+                merchant,
+                payer,
+                asset,
+                &amount,
+            );
         }
     }
 

@@ -196,6 +196,17 @@ pub struct DisputeResolved {
     pub by_default: bool,
 }
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectPayment {
+    #[topic]
+    pub buyer: Address,
+    #[topic]
+    pub seller: Address,
+    pub asset: Address,
+    pub amount: i128,
+}
+
 // Build metadata embedded in the wasm (SEP-0055), so anyone can trace a
 // deployed contract back to its source; see scripts/verify.sh.
 soroban_sdk::contractmeta!(key = "source_repo", val = "github:StellarPOS-App/contracts");
@@ -216,6 +227,37 @@ impl EscrowService {
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().set(&DataKey::Count, &0u64);
         extend_instance(&env);
+        Ok(())
+    }
+
+    /// Fast path for immediate direct payments when both buyer and seller
+    /// agree to bypass escrow creation, storage writes, and separate release.
+    pub fn pay_direct(
+        env: Env,
+        buyer: Address,
+        seller: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<(), EscrowError> {
+        Self::require_not_paused(&env)?;
+        if amount <= 0 {
+            return Err(EscrowError::InvalidAmount);
+        }
+        if buyer == seller {
+            return Err(EscrowError::InvalidParties);
+        }
+        buyer.require_auth();
+        seller.require_auth();
+
+        token::Client::new(&env, &asset).transfer(&buyer, &seller, &amount);
+
+        DirectPayment {
+            buyer,
+            seller,
+            asset,
+            amount,
+        }
+        .publish(&env);
         Ok(())
     }
 
