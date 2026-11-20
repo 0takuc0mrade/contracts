@@ -21,7 +21,7 @@
 
 #![no_std]
 
-use shared::{extend_instance, extend_persistent, split_fee, MAX_FEE_BPS};
+use shared::{extend_instance, extend_persistent, is_entry_valid, split_fee, MAX_FEE_BPS};
 use soroban_sdk::{
     contract, contractclient, contracterror, contractevent, contractimpl, contracttype, token,
     Address, BytesN, Env, Map, String, Vec,
@@ -79,10 +79,14 @@ pub enum PaymentError {
     AlreadyRefunded = 11,
     Overflow = 12,
     InvalidBatch = 13,
+ stellar-fixes-consolidated
+    ExpiredLedgerEntry = 14,
+
     /// The token did not credit the recipient with the amount transferred.
     TransferFailed = 14,
     InvalidSplit = 14,
     Reentrancy = 15,
+ main
 }
 
 #[contracttype]
@@ -142,6 +146,16 @@ pub struct Config {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Delegation {
+    pub delegator: Address,
+    pub delegatee: Address,
+    pub spending_limit: i128,
+    pub spent: i128,
+    pub expiry: u64,
+}
+
+#[contracttype]
 #[derive(Clone)]
 enum DataKey {
     Config,
@@ -149,7 +163,12 @@ enum DataKey {
     EventIndex,
     Payment(u64),
     Order(Address, String),
-    Loyalty,
+ stellar-fixes-consolidated
+    Delegation(Address, Address),
+
+    MerchantCallback(Address),
+    ReentrancyLock,
+ main
 }
 
 #[contractevent]
@@ -225,6 +244,26 @@ pub struct ConfigUpdated {
     pub event_index: u64,
 }
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegationCreated {
+    #[topic]
+    pub delegator: Address,
+    #[topic]
+    pub delegatee: Address,
+    pub spending_limit: i128,
+    pub expiry: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegationRevoked {
+    #[topic]
+    pub delegator: Address,
+    #[topic]
+    pub delegatee: Address,
+}
+
 // Build metadata embedded in the wasm (SEP-0055), so anyone can trace a
 // deployed contract back to its source; see scripts/verify.sh.
 soroban_sdk::contractmeta!(key = "source_repo", val = "github:StellarPOS-App/contracts");
@@ -243,7 +282,8 @@ impl PaymentProcessor {
         treasury: Address,
         fee_bps: u32,
     ) -> Result<(), PaymentError> {
-        if env.storage().instance().has(&DataKey::Config) {
+        let storage = env.storage().instance();
+        if storage.has(&DataKey::Config) {
             return Err(PaymentError::AlreadyInitialized);
         }
         admin.require_auth();
@@ -257,8 +297,8 @@ impl PaymentProcessor {
             fee_bps,
             paused: false,
         };
-        env.storage().instance().set(&DataKey::Config, &config);
-        env.storage().instance().set(&DataKey::PaymentCount, &0u64);
+        storage.set(&DataKey::Config, &config);
+        storage.set(&DataKey::PaymentCount, &0u64);
         extend_instance(&env);
         Ok(())
     }
@@ -283,6 +323,48 @@ impl PaymentProcessor {
         Self::settle(
             &env, &config, &payer, merchant, settlement, &asset, amount, order_ref, category,
         )
+    }
+
+    /// Settles a payment using delegated authorization from the actual payer.
+    /// The delegatee (caller) makes the payment on behalf of the delegator,
+    /// deducting from their spending limit. Fails if delegation is expired
+    /// or spending limit is exceeded.
+    pub fn pay_delegated(
+        env: Env,
+        delegator: Address,
+        merchant: Address,
+        asset: Address,
+        amount: i128,
+        order_ref: String,
+    ) -> Result<u64, PaymentError> {
+        let config = Self::config(&env)?;
+        if config.paused {
+            return Err(PaymentError::Paused);
+        }
+        let delegatee = env.current_contract_address();
+        let mut delegation = Self::get_delegation(&env, &delegator, &delegatee)?;
+
+        if env.ledger().timestamp() > delegation.expiry {
+            return Err(PaymentError::InvalidOrderRef);
+        }
+        if delegation.spent.checked_add(amount).ok_or(PaymentError::Overflow)?
+            > delegation.spending_limit
+        {
+            return Err(PaymentError::InvalidAmount);
+        }
+
+        let settlement = Self::settlement_for(&env, &config, &merchant, &asset)?;
+        let payment_id = Self::settle(
+            &env, &config, &delegator, merchant, settlement, &asset, amount, order_ref,
+        )?;
+
+        delegation.spent = delegation
+            .spent
+            .checked_add(amount)
+            .ok_or(PaymentError::Overflow)?;
+        Self::save_delegation(&env, &delegation);
+
+        Ok(payment_id)
     }
 
     /// Settles several payments from one payer in a single transaction: a
@@ -472,6 +554,74 @@ impl PaymentProcessor {
     }
 
     // ---------------------------------------------------------------------
+    // Delegation Management
+    // ---------------------------------------------------------------------
+
+    /// Authorizes a delegatee to make payments on behalf of the delegator,
+    /// up to a specified spending limit that expires at a given timestamp.
+    pub fn create_delegation(
+        env: Env,
+        delegator: Address,
+        delegatee: Address,
+        spending_limit: i128,
+        expiry: u64,
+    ) -> Result<(), PaymentError> {
+        delegator.require_auth();
+        if spending_limit <= 0 {
+            return Err(PaymentError::InvalidAmount);
+        }
+        if expiry <= env.ledger().timestamp() {
+            return Err(PaymentError::InvalidOrderRef);
+        }
+
+        let delegation = Delegation {
+            delegator: delegator.clone(),
+            delegatee: delegatee.clone(),
+            spending_limit,
+            spent: 0,
+            expiry,
+        };
+        Self::save_delegation(&env, &delegation);
+
+        DelegationCreated {
+            delegator,
+            delegatee,
+            spending_limit,
+            expiry,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Revokes a delegation, preventing the delegatee from making further
+    /// payments on behalf of the delegator.
+    pub fn revoke_delegation(
+        env: Env,
+        delegator: Address,
+        delegatee: Address,
+    ) -> Result<(), PaymentError> {
+        delegator.require_auth();
+        let key = DataKey::Delegation(delegator.clone(), delegatee.clone());
+        env.storage().persistent().remove(&key);
+
+        DelegationRevoked {
+            delegator,
+            delegatee,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Gets the current delegation between delegator and delegatee.
+    pub fn get_delegation_info(
+        env: Env,
+        delegator: Address,
+        delegatee: Address,
+    ) -> Result<Delegation, PaymentError> {
+        Self::get_delegation(&env, &delegator, &delegatee)
+    }
+
+    // ---------------------------------------------------------------------
     // Views
     // ---------------------------------------------------------------------
 
@@ -486,9 +636,8 @@ impl PaymentProcessor {
         merchant: Address,
         order_ref: String,
     ) -> Result<Payment, PaymentError> {
-        let id: u64 = env
-            .storage()
-            .persistent()
+        let storage = env.storage().persistent();
+        let id: u64 = storage
             .get(&DataKey::Order(merchant, order_ref))
             .ok_or(PaymentError::PaymentNotFound)?;
         Self::load(&env, id)
@@ -555,7 +704,7 @@ impl PaymentProcessor {
             return Err(PaymentError::InvalidOrderRef);
         }
         let order_key = DataKey::Order(merchant.clone(), order_ref.clone());
-        if env.storage().persistent().has(&order_key) {
+        if is_entry_valid(env, &order_key) {
             return Err(PaymentError::DuplicateOrder);
         }
 
@@ -600,9 +749,14 @@ impl PaymentProcessor {
             chain_id: env.ledger().network_id(),
         };
         Self::save(env, &payment);
-        env.storage().persistent().set(&order_key, &id);
+        let storage = env.storage();
+        storage.persistent().set(&order_key, &id);
         extend_persistent(env, &order_key);
+ stellar-fixes-consolidated
+        storage.instance().set(&DataKey::PaymentCount, &id);
+
         env.storage().instance().set(&DataKey::PaymentCount, &count);
+ main
         extend_instance(env);
 
         ComplianceRecord {
@@ -764,6 +918,9 @@ impl PaymentProcessor {
 
     fn load(env: &Env, id: u64) -> Result<Payment, PaymentError> {
         let key = DataKey::Payment(id);
+        if !is_entry_valid(env, &key) {
+            return Err(PaymentError::ExpiredLedgerEntry);
+        }
         let payment = env
             .storage()
             .persistent()
@@ -776,6 +933,30 @@ impl PaymentProcessor {
     fn save(env: &Env, payment: &Payment) {
         let key = DataKey::Payment(payment.id);
         env.storage().persistent().set(&key, payment);
+        extend_persistent(env, &key);
+    }
+
+    fn get_delegation(
+        env: &Env,
+        delegator: &Address,
+        delegatee: &Address,
+    ) -> Result<Delegation, PaymentError> {
+        let key = DataKey::Delegation(delegator.clone(), delegatee.clone());
+        if !is_entry_valid(env, &key) {
+            return Err(PaymentError::PaymentNotFound);
+        }
+        let delegation = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(PaymentError::PaymentNotFound)?;
+        extend_persistent(env, &key);
+        Ok(delegation)
+    }
+
+    fn save_delegation(env: &Env, delegation: &Delegation) {
+        let key = DataKey::Delegation(delegation.delegator.clone(), delegation.delegatee.clone());
+        env.storage().persistent().set(&key, delegation);
         extend_persistent(env, &key);
     }
 }

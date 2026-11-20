@@ -64,6 +64,15 @@ where
         .extend_ttl(key, PERSISTENT_THRESHOLD, PERSISTENT_BUMP);
 }
 
+/// Checks if a persistent storage entry has expired.
+/// Returns true if the entry exists and has not expired, false otherwise.
+pub fn is_entry_valid<K>(env: &Env, key: &K) -> bool
+where
+    K: IntoVal<Env, Val>,
+{
+    env.storage().persistent().has(key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
