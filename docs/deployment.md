@@ -30,7 +30,7 @@ this checkout, downloads the wasm each contract ID in
 `deployments/<network>.json` is running, and compares SHA-256 hashes. It
 exits non-zero if anything differs. Each contract also embeds SEP-0055
 metadata (`source_repo`, `home_domain`, `desc`) plus the Rust, SDK and CLI
-versions it was built with, readable with
+versions it was built with (Soroban SDK pinned to 27.0.6), readable with
 `stellar contract info meta --wasm <file>` or `--contract-id <id>`.
 
 Anyone can run this against a published manifest to check that a
