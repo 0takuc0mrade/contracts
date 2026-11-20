@@ -108,6 +108,14 @@ pub struct PauseToggled {
     pub paused: bool,
 }
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WebhookRegistered {
+    #[topic]
+    pub owner: Address,
+    pub url: String,
+}
+
 // Build metadata embedded in the wasm (SEP-0055), so anyone can trace a
 // deployed contract back to its source; see scripts/verify.sh.
 soroban_sdk::contractmeta!(key = "source_repo", val = "github:StellarPOS-App/contracts");
@@ -208,6 +216,13 @@ impl MerchantRegistry {
             accepted_assets,
         }
         .publish(&env);
+        Ok(())
+    }
+
+    pub fn register_webhook(env: Env, owner: Address, url: String) -> Result<(), RegistryError> {
+        Self::require_not_paused(&env)?;
+        owner.require_auth();
+        WebhookRegistered { owner, url }.publish(&env);
         Ok(())
     }
 
