@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- `shared`: floor computed basis-point fees at 0, so a negative fee can never
+  be deducted and overpay a recipient (#169).
+
 ## [0.2.0]
 
 The first version that compiles, tests, and deploys.
