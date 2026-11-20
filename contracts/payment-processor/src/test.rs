@@ -471,6 +471,159 @@ fn batch_size_limits_and_pause() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Royalty splits
+// ---------------------------------------------------------------------------
+
+fn share(recipient: &Address, bps: u32) -> RoyaltyShare {
+    RoyaltyShare {
+        recipient: recipient.clone(),
+        bps,
+    }
+}
+
+#[test]
+fn royalty_split_pays_platform_royalties_and_seller() {
+    let s = setup(250);
+    let artist = Address::generate(&s.env);
+    let curator = Address::generate(&s.env);
+    s.pp.pay_with_royalties(
+        &s.payer,
+        &s.merchant,
+        &s.asset,
+        &(100 * UNIT),
+        &order(&s.env, "NFT-1"),
+        &vec![&s.env, share(&artist, 1_000), share(&curator, 500)],
+    );
+    // fee 2.5 to treasury; net 97.5 -> artist 10%, curator 5%, seller the rest
+    assert_eq!(s.token.balance(&s.treasury), 25 * UNIT / 10);
+    assert_eq!(s.token.balance(&artist), 975 * UNIT / 100);
+    assert_eq!(s.token.balance(&curator), 4_875 * UNIT / 1_000);
+    assert_eq!(s.token.balance(&s.settlement), 828_750 * UNIT / 10_000);
+    assert_eq!(s.token.balance(&s.payer), 900 * UNIT);
+}
+
+#[test]
+fn royalty_split_rejects_zero_shares_and_more_than_one_hundred_percent() {
+    let s = setup(0);
+    let a = Address::generate(&s.env);
+    let b = Address::generate(&s.env);
+    let pay = |r: &str, shares: Vec<RoyaltyShare>| {
+        s.pp.try_pay_with_royalties(
+            &s.payer,
+            &s.merchant,
+            &s.asset,
+            &UNIT,
+            &order(&s.env, r),
+            &shares,
+        )
+    };
+    assert_eq!(
+        pay("A", vec![&s.env, share(&a, 0)]),
+        Err(Ok(PaymentError::InvalidRoyaltySplit))
+    );
+    assert_eq!(
+        pay("B", vec![&s.env, share(&a, 6_000), share(&b, 4_001)]),
+        Err(Ok(PaymentError::InvalidRoyaltySplit))
+    );
+    // exactly 100% leaves nothing for the seller but is allowed
+    pay("C", vec![&s.env, share(&a, 6_000), share(&b, 4_000)])
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.token.balance(&s.settlement), 0);
+    assert_eq!(s.token.balance(&a) + s.token.balance(&b), UNIT);
+}
+
+#[test]
+fn royalty_split_caps_the_number_of_recipients() {
+    let s = setup(0);
+    let mut shares = Vec::new(&s.env);
+    for _ in 0..=MAX_ROYALTY_RECIPIENTS {
+        shares.push_back(share(&Address::generate(&s.env), 100));
+    }
+    assert_eq!(
+        s.pp.try_pay_with_royalties(
+            &s.payer,
+            &s.merchant,
+            &s.asset,
+            &UNIT,
+            &order(&s.env, "X"),
+            &shares
+        ),
+        Err(Ok(PaymentError::InvalidRoyaltySplit))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Governance
+// ---------------------------------------------------------------------------
+
+#[test]
+fn governance_moves_parameter_changes_to_council_votes() {
+    let s = setup(250);
+    let (a, b, c) = (
+        Address::generate(&s.env),
+        Address::generate(&s.env),
+        Address::generate(&s.env),
+    );
+    s.pp.enable_governance(&vec![&s.env, a.clone(), b.clone(), c.clone()], &2);
+
+    // the admin can no longer change critical parameters alone
+    assert_eq!(
+        s.pp.try_set_fee_bps(&100),
+        Err(Ok(PaymentError::GovernanceActive))
+    );
+    assert_eq!(
+        s.pp.try_set_treasury(&a),
+        Err(Ok(PaymentError::GovernanceActive))
+    );
+
+    let id = s.pp.propose_param_change(&a, &ParamChange::FeeBps(100));
+    assert_eq!(s.pp.get_config().fee_bps, 250, "one approval is not enough");
+    assert_eq!(
+        s.pp.try_approve_param_change(&a, &id),
+        Err(Ok(PaymentError::AlreadyApproved))
+    );
+    assert!(s.pp.approve_param_change(&b, &id));
+    assert_eq!(s.pp.get_config().fee_bps, 100);
+    assert!(s.pp.get_param_proposal(&id).executed);
+    assert_eq!(
+        s.pp.try_approve_param_change(&c, &id),
+        Err(Ok(PaymentError::ProposalExecuted))
+    );
+
+    let outsider = Address::generate(&s.env);
+    assert_eq!(
+        s.pp.try_propose_param_change(&outsider, &ParamChange::Treasury(outsider.clone())),
+        Err(Ok(PaymentError::NotCouncilMember))
+    );
+    assert_eq!(
+        s.pp.try_propose_param_change(&a, &ParamChange::FeeBps(MAX_FEE_BPS + 1)),
+        Err(Ok(PaymentError::InvalidFeeRate))
+    );
+}
+
+#[test]
+fn governance_validates_the_council() {
+    let s = setup(250);
+    let a = Address::generate(&s.env);
+    assert_eq!(
+        s.pp.try_enable_governance(&vec![&s.env, a.clone()], &2),
+        Err(Ok(PaymentError::InvalidGovernance))
+    );
+    assert_eq!(
+        s.pp.try_enable_governance(&vec![&s.env, a.clone(), a.clone()], &1),
+        Err(Ok(PaymentError::InvalidGovernance))
+    );
+    s.pp.enable_governance(&vec![&s.env, a.clone()], &1);
+    assert_eq!(
+        s.pp.try_enable_governance(&vec![&s.env, a.clone()], &1),
+        Err(Ok(PaymentError::GovernanceActive))
+    );
+
+    // a threshold of one applies the proposal immediately
+    s.pp.propose_param_change(&a, &ParamChange::Treasury(a.clone()));
+    assert_eq!(s.pp.get_config().treasury, a);
 #[test]
 fn split_payment_distributes_across_contributors() {
     let s = setup(200); // 2% fee
