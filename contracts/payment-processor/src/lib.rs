@@ -111,6 +111,7 @@ pub struct Config {
 enum DataKey {
     Config,
     PaymentCount,
+    EventIndex,
     Payment(u64),
     Order(Address, String),
 }
@@ -127,6 +128,7 @@ pub struct PaymentSettled {
     pub amount: i128,
     pub fee: i128,
     pub order_ref: String,
+    pub event_index: u64,
 }
 
 #[contractevent]
@@ -139,6 +141,7 @@ pub struct PaymentRefunded {
     pub amount: i128,
     pub total_refunded: i128,
     pub reason: String,
+    pub event_index: u64,
 }
 
 #[contractevent]
@@ -147,6 +150,7 @@ pub struct ConfigUpdated {
     pub fee_bps: u32,
     pub treasury: Address,
     pub paused: bool,
+    pub event_index: u64,
 }
 
 // Build metadata embedded in the wasm (SEP-0055), so anyone can trace a
@@ -301,6 +305,7 @@ impl PaymentProcessor {
             amount,
             total_refunded: total,
             reason,
+            event_index: Self::next_event_index(&env),
         }
         .publish(&env);
         Ok(total)
@@ -470,6 +475,7 @@ impl PaymentProcessor {
             amount,
             fee,
             order_ref,
+            event_index: Self::next_event_index(env),
         }
         .publish(env);
         Ok(id)
@@ -492,9 +498,19 @@ impl PaymentProcessor {
             fee_bps: config.fee_bps,
             treasury: config.treasury,
             paused: config.paused,
+            event_index: Self::next_event_index(env),
         }
         .publish(env);
         Ok(())
+    }
+
+    /// Global monotonic counter in persistent storage, so event indices are
+    /// never reissued across upgrades or payment restarts.
+    fn next_event_index(env: &Env) -> u64 {
+        let idx: u64 = env.storage().persistent().get(&DataKey::EventIndex).unwrap_or(0) + 1;
+        env.storage().persistent().set(&DataKey::EventIndex, &idx);
+        extend_persistent(env, &DataKey::EventIndex);
+        idx
     }
 
     fn load(env: &Env, id: u64) -> Result<Payment, PaymentError> {
