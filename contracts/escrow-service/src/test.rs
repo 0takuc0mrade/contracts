@@ -202,3 +202,33 @@ fn creation_validation() {
         Err(Ok(EscrowError::InvalidSchedule))
     );
 }
+
+#[test]
+fn pay_direct_bypasses_escrow_when_both_parties_agree() {
+    let s = setup();
+    s.client.pay_direct(&s.buyer, &s.seller, &s.asset, &1_500);
+
+    assert_eq!(s.token.balance(&s.buyer), 8_500);
+    assert_eq!(s.token.balance(&s.seller), 1_500);
+    // Contract neither custodies funds nor writes an escrow record
+    assert_eq!(s.token.balance(&s.client.address), 0);
+    assert_eq!(s.client.escrow_count(), 0);
+}
+
+#[test]
+fn pay_direct_validates_inputs_and_respects_pause() {
+    let s = setup();
+    assert_eq!(
+        s.client.try_pay_direct(&s.buyer, &s.seller, &s.asset, &0),
+        Err(Ok(EscrowError::InvalidAmount))
+    );
+    assert_eq!(
+        s.client.try_pay_direct(&s.buyer, &s.buyer, &s.asset, &100),
+        Err(Ok(EscrowError::InvalidParties))
+    );
+    s.client.pause();
+    assert_eq!(
+        s.client.try_pay_direct(&s.buyer, &s.seller, &s.asset, &100),
+        Err(Ok(EscrowError::Paused))
+    );
+}
