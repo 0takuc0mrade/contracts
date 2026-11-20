@@ -4,6 +4,7 @@ Soroban smart contracts for StellarPOS, a point-of-sale system for merchants
 who accept payment on the Stellar network.
 
 [![CI](https://github.com/StellarPOS-App/contracts/actions/workflows/ci.yml/badge.svg)](https://github.com/StellarPOS-App/contracts/actions/workflows/ci.yml)
+[![Coverage](https://codecov.io/gh/StellarPOS-App/contracts/graph/badge.svg)](https://codecov.io/gh/StellarPOS-App/contracts)
 ![soroban-sdk](https://img.shields.io/badge/soroban--sdk-27.0.6-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
