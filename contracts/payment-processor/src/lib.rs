@@ -33,8 +33,8 @@
 use shared::{bps_of, extend_instance, extend_persistent, split_fee, BPS_DENOMINATOR, MAX_FEE_BPS};
 use shared::{extend_instance, extend_persistent, is_entry_valid, split_fee, MAX_FEE_BPS};
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractevent, contractimpl, contracttype,
-    symbol_short, token, xdr::ToXdr, Address, Env, Map, String, Symbol, Vec,
+    contract, contractclient, contracterror, contractevent, contractimpl, contracttype, token,
+    Address, BytesN, Env, Map, String, Vec,
 };
 
 pub const MAX_ORDER_REF_LEN: u32 = 64;
@@ -131,9 +131,11 @@ pub struct Payment {
     pub fee: i128,
     pub refunded: i128,
     pub order_ref: String,
+    pub category: String,
     pub loyalty_points: u64,
     pub status: PaymentStatus,
     pub created_at: u64,
+    pub chain_id: BytesN<32>,
 }
 
 /// One line of a batch payment.
@@ -143,6 +145,7 @@ pub struct BatchLine {
     pub merchant: Address,
     pub amount: i128,
     pub order_ref: String,
+    pub category: String,
 }
 
 /// One royalty recipient and its share of the net amount, in basis points.
@@ -191,7 +194,6 @@ pub struct Config {
     pub registry: Address,
     pub treasury: Address,
     pub fee_bps: u32,
-    pub loyalty: Option<Address>,
     pub paused: bool,
 }
 
@@ -238,7 +240,8 @@ pub struct PaymentSettled {
     pub amount: i128,
     pub fee: i128,
     pub order_ref: String,
-    pub event_index: u64,
+    pub category: String,
+    pub chain_id: BytesN<32>,
 }
 
 #[contractevent]
@@ -383,7 +386,6 @@ impl PaymentProcessor {
             registry,
             treasury,
             fee_bps,
-            loyalty: None,
             paused: false,
         };
         env.storage().instance().set(&DataKey::Config, &config);
@@ -404,128 +406,17 @@ impl PaymentProcessor {
         asset: Address,
         amount: i128,
         order_ref: String,
+        category: String,
     ) -> Result<u64, PaymentError> {
-        Self::with_reentrancy_guard(&env, || {
-            let config = Self::config(&env)?;
-            if config.paused {
-                return Err(PaymentError::Paused);
-            }
-            payer.require_auth();
-            let settlement = Self::settlement_for(&env, &config, &merchant, &asset)?;
-            Self::settle(
-                &env, &config, &payer, merchant, settlement, &asset, amount, order_ref,
-            )
-        })
-    }
-
-    /// Settles a group purchase by splitting a single payment across multiple
-    /// contributing buyers. Every contributor authorizes their share; all
-    /// transfers settle atomically or none do.
-    pub fn split_payment(
-        env: Env,
-        merchant: Address,
-        asset: Address,
-        shares: Vec<SplitShare>,
-        order_ref: String,
-    ) -> Result<u64, PaymentError> {
-        Self::with_reentrancy_guard(&env, || {
-            let config = Self::config(&env)?;
-            if config.paused {
-                return Err(PaymentError::Paused);
-            }
-            if shares.is_empty() || shares.len() > MAX_SPLITS {
-                return Err(PaymentError::InvalidSplit);
-            }
-            if order_ref.is_empty() || order_ref.len() > MAX_ORDER_REF_LEN {
-                return Err(PaymentError::InvalidOrderRef);
-            }
-            let order_key = DataKey::Order(merchant.clone(), order_ref.clone());
-            if env.storage().persistent().has(&order_key) {
-                return Err(PaymentError::DuplicateOrder);
-            }
-
-            let settlement = Self::settlement_for(&env, &config, &merchant, &asset)?;
-
-            let mut total_amount: i128 = 0;
-            for share in shares.iter() {
-                if share.amount <= 0 {
-                    return Err(PaymentError::InvalidAmount);
-                }
-                total_amount = total_amount
-                    .checked_add(share.amount)
-                    .ok_or(PaymentError::Overflow)?;
-                share.payer.require_auth();
-            }
-
-            let token = token::Client::new(&env, &asset);
-            let mut total_fee: i128 = 0;
-            let mut total_loyalty: u64 = 0;
-            for share in shares.iter() {
-                let (fee, net) =
-                    split_fee(share.amount, config.fee_bps).ok_or(PaymentError::Overflow)?;
-                token.transfer(&share.payer, &settlement, &net);
-                if fee > 0 {
-                    token.transfer(&share.payer, &config.treasury, &fee);
-                }
-                total_fee = total_fee.checked_add(fee).ok_or(PaymentError::Overflow)?;
-                if let Some(loyalty) = &config.loyalty {
-                    let pts = LoyaltyClient::new(&env, loyalty).accrue(
-                        &env.current_contract_address(),
-                        &merchant,
-                        &share.payer,
-                        &share.amount,
-                    );
-                    total_loyalty = total_loyalty
-                        .checked_add(pts)
-                        .ok_or(PaymentError::Overflow)?;
-                }
-            }
-
-            let primary_payer = shares.get(0).ok_or(PaymentError::InvalidSplit)?.payer;
-            let id = Self::payment_count(env.clone())
-                .checked_add(1)
-                .ok_or(PaymentError::Overflow)?;
-            let payment = Payment {
-                id,
-                payer: primary_payer.clone(),
-                merchant: merchant.clone(),
-                settlement,
-                asset: asset.clone(),
-                amount: total_amount,
-                fee: total_fee,
-                refunded: 0,
-                order_ref: order_ref.clone(),
-                loyalty_points: total_loyalty,
-                status: PaymentStatus::Completed,
-                created_at: env.ledger().timestamp(),
-            };
-            Self::save(&env, &payment);
-            env.storage().persistent().set(&order_key, &id);
-            extend_persistent(&env, &order_key);
-            env.storage().instance().set(&DataKey::PaymentCount, &id);
-            extend_instance(&env);
-
-            PaymentSplit {
-                merchant: merchant.clone(),
-                payment_id: id,
-                asset: asset.clone(),
-                total_amount,
-                fee: total_fee,
-                contributors: shares.len(),
-                order_ref,
-            }
-            .publish(&env);
-
-            Self::invoke_merchant_callback(
-                &env,
-                id,
-                &merchant,
-                &primary_payer,
-                &asset,
-                total_amount,
-            );
-            Ok(id)
-        })
+        let config = Self::config(&env)?;
+        if config.paused {
+            return Err(PaymentError::Paused);
+        }
+        payer.require_auth();
+        let settlement = Self::settlement_for(&env, &config, &merchant, &asset)?;
+        Self::settle(
+            &env, &config, &payer, merchant, settlement, &asset, amount, order_ref, category,
+        )
     }
 
     /// Settles a payment using delegated authorization from the actual payer.
@@ -660,6 +551,12 @@ impl PaymentProcessor {
                 &asset,
                 line.amount,
                 line.order_ref,
+ martinez19th/fix-issue-batch
+                line.category,
+            )?);
+        }
+        Ok(ids)
+
                 &Vec::new(&env),
             )?);
         }
@@ -699,6 +596,7 @@ impl PaymentProcessor {
             }
             Ok(ids)
         })
+ main
     }
 
     /// Refunds part or all of a payment from the merchant's settlement
@@ -944,7 +842,14 @@ impl PaymentProcessor {
     /// Enables loyalty accrual through the given loyalty program contract.
     /// Pass `None` to switch accrual off.
     pub fn set_loyalty(env: Env, loyalty: Option<Address>) -> Result<(), PaymentError> {
-        Self::update(&env, |c| c.loyalty = loyalty)
+        let config = Self::config(&env)?;
+        config.admin.require_auth();
+        match loyalty {
+            Some(addr) => env.storage().instance().set(&DataKey::Loyalty, &addr),
+            None => env.storage().instance().remove(&DataKey::Loyalty),
+        }
+        extend_instance(&env);
+        Ok(())
     }
 
     pub fn pause(env: Env) -> Result<(), PaymentError> {
@@ -1065,6 +970,10 @@ impl PaymentProcessor {
         Self::config(&env)
     }
 
+    pub fn get_loyalty(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Loyalty)
+    }
+
     /// Fee and net split for a prospective payment, for checkout previews.
     pub fn quote(env: Env, amount: i128) -> Result<(i128, i128), PaymentError> {
         if amount <= 0 {
@@ -1102,7 +1011,11 @@ impl PaymentProcessor {
         asset: &Address,
         amount: i128,
         order_ref: String,
+martinez19th/fix-issue-batch
+        category: String,
+
         royalties: &Vec<RoyaltyShare>,
+ main
     ) -> Result<u64, PaymentError> {
         if amount <= 0 {
             return Err(PaymentError::InvalidAmount);
@@ -1143,8 +1056,8 @@ impl PaymentProcessor {
             Self::transfer_checked(&client, payer, &config.treasury, fee)?;
         }
 
-        let loyalty_points = match &config.loyalty {
-            Some(loyalty) => LoyaltyClient::new(env, loyalty).accrue(
+        let loyalty_points = match env.storage().instance().get::<_, Address>(&DataKey::Loyalty) {
+            Some(loyalty) => LoyaltyClient::new(env, &loyalty).accrue(
                 &env.current_contract_address(),
                 &merchant,
                 payer,
@@ -1180,9 +1093,11 @@ impl PaymentProcessor {
             fee,
             refunded: 0,
             order_ref: order_ref.clone(),
+            category: category.clone(),
             loyalty_points,
             status: PaymentStatus::Completed,
             created_at: env.ledger().timestamp(),
+            chain_id: env.ledger().network_id(),
         };
         Self::save(env, &payment);
         let storage = env.storage();
@@ -1223,7 +1138,8 @@ impl PaymentProcessor {
             amount,
             fee,
             order_ref,
-            event_index: Self::next_event_index(env),
+            category,
+            chain_id: env.ledger().network_id(),
         }
         .publish(env);
 
