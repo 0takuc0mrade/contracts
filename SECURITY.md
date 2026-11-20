@@ -45,3 +45,15 @@ Report any way to break these:
    signers.
 5. Escrowed funds always leave through release, claim, refund, or a dispute
    ruling. No path strands them.
+6. In production deployments, every contract `admin` address must be a
+   multisig contract (such as the deployed `treasury` M-of-N multisig) or a
+   Stellar M-of-N multisig account — never a single-key EOA.
+
+## Admin key management
+
+Contract `admin` roles can pause/unpause contracts, update protocol fee rates
+and fee recipients, and approve or suspend merchants. Because `soroban_sdk::Address`
+does not restrict an admin to a specific account type on-chain, production
+deployments **must** initialize contracts with a multisig contract (or Stellar
+M-of-N multisig account) as `admin` so no single compromised key can alter
+protocol configuration.

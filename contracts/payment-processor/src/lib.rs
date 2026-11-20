@@ -210,6 +210,8 @@ pub struct Delegation {
 enum DataKey {
     Config,
     PaymentCount,
+    NextPaymentId,
+    MerchantPaymentCount(Address),
     EventIndex,
     Payment(u64),
     Order(Address, String),
@@ -354,6 +356,13 @@ pub struct PaymentProcessor;
 
 #[contractimpl]
 impl PaymentProcessor {
+    /// Initializes the payment processor.
+    ///
+    /// # Security
+    ///
+    /// In production deployments, `admin` **must** be a multisig contract
+    /// (such as the deployed `treasury` M-of-N multisig) or a Stellar M-of-N
+    /// multisig account rather than a single-key EOA. See `SECURITY.md`.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -377,6 +386,9 @@ impl PaymentProcessor {
             loyalty: None,
             paused: false,
         };
+        env.storage().instance().set(&DataKey::Config, &config);
+        env.storage().instance().set(&DataKey::PaymentCount, &0u64);
+        env.storage().instance().set(&DataKey::NextPaymentId, &0u64);
         storage.set(&DataKey::Config, &config);
         storage.set(&DataKey::PaymentCount, &0u64);
         extend_instance(&env);
@@ -698,6 +710,12 @@ impl PaymentProcessor {
         amount: i128,
         reason: String,
     ) -> Result<i128, PaymentError> {
+        let config = Self::config(&env)?;
+        if config.paused {
+            return Err(PaymentError::Paused);
+        }
+        let mut payment = Self::load(&env, payment_id)?;
+        payment.settlement.require_auth();
         Self::with_reentrancy_guard(&env, || {
             let mut payment = Self::load(&env, payment_id)?;
             payment.settlement.require_auth();
@@ -752,6 +770,19 @@ impl PaymentProcessor {
             PaymentStatus::PartiallyRefunded
         };
         Self::save(&env, &payment);
+
+        if payment.status == PaymentStatus::Refunded {
+            let active = Self::payment_count(env.clone()).saturating_sub(1);
+            env.storage()
+                .instance()
+                .set(&DataKey::PaymentCount, &active);
+            let m_key = DataKey::MerchantPaymentCount(payment.merchant.clone());
+            let m_active = Self::merchant_payment_count(env.clone(), payment.merchant.clone())
+                .saturating_sub(1);
+            env.storage().persistent().set(&m_key, &m_active);
+            extend_persistent(&env, &m_key);
+            extend_instance(&env);
+        }
 
         ComplianceRecord {
             kind: symbol_short!("refund"),
@@ -1014,10 +1045,19 @@ impl PaymentProcessor {
         Self::load(&env, id)
     }
 
+    /// Number of active (non-fully-refunded) payments.
     pub fn payment_count(env: Env) -> u64 {
         env.storage()
             .instance()
             .get(&DataKey::PaymentCount)
+            .unwrap_or(0)
+    }
+
+    /// Number of active (non-fully-refunded) payments for a specific merchant.
+    pub fn merchant_payment_count(env: Env, merchant: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantPaymentCount(merchant))
             .unwrap_or(0)
     }
 
@@ -1113,6 +1153,16 @@ impl PaymentProcessor {
             None => 0,
         };
 
+        let prev_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextPaymentId)
+            .unwrap_or_else(|| Self::payment_count(env.clone()));
+        let id = prev_id.checked_add(1).ok_or(PaymentError::Overflow)?;
+        let active_count = Self::payment_count(env.clone())
+            .checked_add(1)
+            .ok_or(PaymentError::Overflow)?;
+        let m_count = Self::merchant_payment_count(env.clone(), merchant.clone())
         let count = Self::payment_count(env.clone())
             .checked_add(1)
             .ok_or(PaymentError::Overflow)?;
@@ -1138,6 +1188,13 @@ impl PaymentProcessor {
         let storage = env.storage();
         storage.persistent().set(&order_key, &id);
         extend_persistent(env, &order_key);
+        let m_key = DataKey::MerchantPaymentCount(merchant.clone());
+        env.storage().persistent().set(&m_key, &m_count);
+        extend_persistent(env, &m_key);
+        env.storage().instance().set(&DataKey::NextPaymentId, &id);
+        env.storage()
+            .instance()
+            .set(&DataKey::PaymentCount, &active_count);
  stellar-fixes-consolidated
         storage.instance().set(&DataKey::PaymentCount, &id);
 

@@ -127,6 +127,13 @@ pub struct MerchantRegistry;
 
 #[contractimpl]
 impl MerchantRegistry {
+    /// Initializes the merchant registry.
+    ///
+    /// # Security
+    ///
+    /// In production deployments, `admin` **must** be a multisig contract
+    /// (such as the deployed `treasury` M-of-N multisig) or a Stellar M-of-N
+    /// multisig account rather than a single-key EOA. See `SECURITY.md`.
     pub fn initialize(env: Env, admin: Address) -> Result<(), RegistryError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(RegistryError::AlreadyInitialized);
