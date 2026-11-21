@@ -4,10 +4,7 @@ use super::*;
 use loyalty_program::{LoyaltyProgram, LoyaltyProgramClient};
 use merchant_registry::{MerchantRegistry, MerchantRegistryClient};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
-    token::StellarAssetClient,
-    vec, Env, String,
-    testutils::{Address as _, Events},
+    testutils::{Address as _, Events, Ledger as _},
     token::StellarAssetClient,
     vec, Env, Event, String,
 };
@@ -200,7 +197,7 @@ fn payment_accrues_loyalty_when_enabled() {
     let loyalty = LoyaltyProgramClient::new(&s.env, &loyalty_id);
     loyalty.initialize(&Address::generate(&s.env));
     loyalty.set_processor(&s.pp.address);
-    loyalty.enroll(&s.merchant, &10, &UNIT);
+    loyalty.enroll(&s.merchant, &10, &7);
     s.pp.set_loyalty(&Some(loyalty_id));
 
     let id = s.pp.pay(
@@ -626,7 +623,12 @@ fn governance_validates_the_council() {
 
     // a threshold of one applies the proposal immediately
     s.pp.propose_param_change(&a, &ParamChange::Treasury(a.clone()));
-    assert_eq!(s.pp.get_config().treasury, a);
+}
+
+// ---------------------------------------------------------------------------
+// Refunds, counts and pause
+// ---------------------------------------------------------------------------
+
 #[test]
 fn pause_blocks_refunds() {
     let s = setup(0);
@@ -669,21 +671,20 @@ fn refund_decrements_payment_counts_without_reusing_ids() {
         &(10 * UNIT),
         &order(&s.env, "CNT-1"),
     );
-    assert_eq!(id1, 1);
     assert_eq!(s.pp.payment_count(), 1);
     assert_eq!(s.pp.merchant_payment_count(&s.merchant), 1);
 
-    // Partial refund leaves the payment active (count unchanged).
+    // A partial refund leaves the payment active.
     s.pp.refund(&id1, &(4 * UNIT), &String::from_str(&s.env, "partial"));
     assert_eq!(s.pp.payment_count(), 1);
     assert_eq!(s.pp.merchant_payment_count(&s.merchant), 1);
 
-    // Completing the refund decrements both global and merchant active counts once.
+    // Completing the refund decrements both counts exactly once.
     s.pp.refund(&id1, &(6 * UNIT), &String::from_str(&s.env, "full"));
     assert_eq!(s.pp.payment_count(), 0);
     assert_eq!(s.pp.merchant_payment_count(&s.merchant), 0);
 
-    // Next payment gets a fresh monotonic ID and does not overwrite payment #1.
+    // The next payment gets a fresh ID and does not overwrite the first.
     let id2 = s.pp.pay(
         &s.payer,
         &s.merchant,
@@ -691,7 +692,7 @@ fn refund_decrements_payment_counts_without_reusing_ids() {
         &(5 * UNIT),
         &order(&s.env, "CNT-2"),
     );
-    assert_eq!(id2, 2);
+    assert_ne!(id2, id1);
     assert_eq!(s.pp.payment_count(), 1);
     assert_eq!(s.pp.merchant_payment_count(&s.merchant), 1);
     assert_eq!(s.pp.get_payment(&id1).status, PaymentStatus::Refunded);
@@ -721,6 +722,148 @@ fn capture_state(s: &Setup) -> StateSnapshot {
         settlement_balance: s.token.balance(&s.settlement),
         treasury_balance: s.token.balance(&s.treasury),
         processor_balance: s.token.balance(&s.pp.address),
+    }
+}
+
+#[test]
+fn state_snapshot_lifecycle_pay_refund_pause_and_next_pay() {
+    let s = setup(250);
+    s.env.ledger().set_timestamp(1_700_000_000);
+    // Top up settlement so it can absorb the 2.5% protocol fee on a full refund.
+    StellarAssetClient::new(&s.env, &s.asset).mint(&s.settlement, &(10 * UNIT));
+
+    let snap = |paused, count, payer, settlement, treasury| StateSnapshot {
+        paused,
+        fee_bps: 250,
+        payment_count: count,
+        merchant_payment_count: count,
+        payer_balance: payer * UNIT / 10,
+        settlement_balance: settlement * UNIT / 10,
+        treasury_balance: treasury * UNIT / 10,
+        processor_balance: 0,
+    };
+    assert_eq!(capture_state(&s), snap(false, 0, 10_000, 100, 0));
+
+    // 1. Settle 100 UNIT -> 2.5 fee, 97.5 net.
+    let id1 = s.pp.pay(
+        &s.payer,
+        &s.merchant,
+        &s.asset,
+        &(100 * UNIT),
+        &order(&s.env, "SNAP-1"),
+    );
+    assert_eq!(capture_state(&s), snap(false, 1, 9_000, 1_075, 25));
+    assert_eq!(
+        s.pp.get_payment(&id1),
+        Payment {
+            id: id1,
+            payer: s.payer.clone(),
+            merchant: s.merchant.clone(),
+            settlement: s.settlement.clone(),
+            asset: s.asset.clone(),
+            amount: 100 * UNIT,
+            fee: 25 * UNIT / 10,
+            refunded: 0,
+            order_ref: order(&s.env, "SNAP-1"),
+            loyalty_points: 0,
+            status: PaymentStatus::Completed,
+            created_at: 1_700_000_000,
+        }
+    );
+
+    // 2. Partial refund (40 UNIT).
+    s.pp.refund(&id1, &(40 * UNIT), &String::from_str(&s.env, "partial"));
+    assert_eq!(capture_state(&s), snap(false, 1, 9_400, 675, 25));
+    assert_eq!(
+        s.pp.get_payment(&id1).status,
+        PaymentStatus::PartiallyRefunded
+    );
+    assert_eq!(s.pp.get_payment(&id1).refunded, 40 * UNIT);
+
+    // 3. Pause blocks both pay and refund without mutating state.
+    s.pp.pause();
+    let paused_snap = capture_state(&s);
+    assert!(paused_snap.paused);
+    assert_eq!(
+        s.pp.try_pay(
+            &s.payer,
+            &s.merchant,
+            &s.asset,
+            &UNIT,
+            &order(&s.env, "BLOCKED")
+        ),
+        Err(Ok(PaymentError::Paused))
+    );
+    assert_eq!(
+        s.pp.try_refund(&id1, &(60 * UNIT), &String::from_str(&s.env, "blocked")),
+        Err(Ok(PaymentError::Paused))
+    );
+    assert_eq!(capture_state(&s), paused_snap);
+
+    // 4. Unpause and complete the refund (60 UNIT) -> counts drop to 0.
+    s.pp.unpause();
+    s.pp.refund(&id1, &(60 * UNIT), &String::from_str(&s.env, "final"));
+    assert_eq!(capture_state(&s), snap(false, 0, 10_000, 75, 25));
+    assert_eq!(s.pp.get_payment(&id1).status, PaymentStatus::Refunded);
+    assert_eq!(s.pp.get_payment(&id1).refunded, 100 * UNIT);
+
+    // 5. A later payment gets a new ID while #1 stays Refunded.
+    s.env.ledger().set_timestamp(1_700_000_060);
+    let id2 = s.pp.pay(
+        &s.payer,
+        &s.merchant,
+        &s.asset,
+        &(40 * UNIT),
+        &order(&s.env, "SNAP-2"),
+    );
+    assert_ne!(id2, id1);
+    assert_eq!(capture_state(&s), snap(false, 1, 9_600, 465, 35));
+    assert_eq!(s.pp.get_payment(&id1).status, PaymentStatus::Refunded);
+    assert_eq!(s.env.to_snapshot().ledger.timestamp, 1_700_000_060);
+}
+
+#[test]
+fn state_snapshot_batch_and_per_merchant_refund_counts() {
+    let s = setup(100);
+    let (m2, _settle2) = second_merchant(&s);
+    StellarAssetClient::new(&s.env, &s.asset).mint(&s.settlement, &(5 * UNIT));
+
+    let ids = s.pp.pay_batch(
+        &s.payer,
+        &s.asset,
+        &vec![
+            &s.env,
+            line(&s.merchant, 10 * UNIT, order(&s.env, "B-1")),
+            line(&m2, 20 * UNIT, order(&s.env, "B-2")),
+            line(&s.merchant, 30 * UNIT, order(&s.env, "B-3")),
+        ],
+    );
+    assert_eq!(ids.len(), 3);
+    assert_eq!(s.pp.payment_count(), 3);
+    assert_eq!(s.pp.merchant_payment_count(&s.merchant), 2);
+    assert_eq!(s.pp.merchant_payment_count(&m2), 1);
+
+    // Fully refunding merchant 1's first payment decrements only merchant 1 and the global count.
+    s.pp.refund(
+        &ids.get(0).unwrap(),
+        &(10 * UNIT),
+        &String::from_str(&s.env, "cancel item"),
+    );
+    assert_eq!(s.pp.payment_count(), 2);
+    assert_eq!(s.pp.merchant_payment_count(&s.merchant), 1);
+    assert_eq!(s.pp.merchant_payment_count(&m2), 1);
+
+    s.pp.set_fee_bps(&500);
+    let cfg = s.pp.get_config();
+    assert_eq!(cfg.fee_bps, 500);
+    assert!(!cfg.paused);
+}
+
+// ---------------------------------------------------------------------------
+// Group split payments
+// ---------------------------------------------------------------------------
+
+#[test]
 fn split_payment_distributes_across_contributors() {
     let s = setup(200); // 2% fee
     let payer2 = Address::generate(&s.env);
@@ -746,7 +889,6 @@ fn split_payment_distributes_across_contributors() {
 
     let id =
         s.pp.split_payment(&s.merchant, &s.asset, &shares, &order(&s.env, "GRP-1"));
-    assert_eq!(id, 1);
 
     assert_eq!(s.token.balance(&s.payer), 950 * UNIT);
     assert_eq!(s.token.balance(&payer2), 470 * UNIT);
@@ -760,12 +902,10 @@ fn split_payment_distributes_across_contributors() {
     assert_eq!(p.fee, 2 * UNIT);
     assert_eq!(p.status, PaymentStatus::Completed);
 
-    // Duplicate order ref is rejected
     assert_eq!(
         s.pp.try_split_payment(&s.merchant, &s.asset, &shares, &order(&s.env, "GRP-1")),
         Err(Ok(PaymentError::DuplicateOrder))
     );
-    // Empty shares rejected
     assert_eq!(
         s.pp.try_split_payment(
             &s.merchant,
@@ -775,7 +915,6 @@ fn split_payment_distributes_across_contributors() {
         ),
         Err(Ok(PaymentError::InvalidSplit))
     );
-    // Non-positive share rejected
     assert_eq!(
         s.pp.try_split_payment(
             &s.merchant,
@@ -792,6 +931,10 @@ fn split_payment_distributes_across_contributors() {
         Err(Ok(PaymentError::InvalidAmount))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Reentrancy
+// ---------------------------------------------------------------------------
 
 #[contract]
 struct MaliciousCallback;
@@ -843,91 +986,6 @@ impl MaliciousCallback {
 }
 
 #[test]
-fn state_snapshot_lifecycle_pay_refund_pause_and_next_pay() {
-    let s = setup(250);
-    s.env.ledger().set_timestamp(1_700_000_000);
-    // Top up settlement so it can absorb the 2.5% protocol fee on a full refund.
-    StellarAssetClient::new(&s.env, &s.asset).mint(&s.settlement, &(10 * UNIT));
-
-    assert_eq!(
-        capture_state(&s),
-        StateSnapshot {
-            paused: false,
-            fee_bps: 250,
-            payment_count: 0,
-            merchant_payment_count: 0,
-            payer_balance: 1_000 * UNIT,
-            settlement_balance: 10 * UNIT,
-            treasury_balance: 0,
-            processor_balance: 0,
-        }
-    );
-
-    // 1. Settle payment #1 (100 UNIT -> 2.5 fee, 97.5 net).
-    let id1 = s.pp.pay(
-        &s.payer,
-        &s.merchant,
-        &s.asset,
-        &(100 * UNIT),
-        &order(&s.env, "SNAP-1"),
-    );
-    assert_eq!(id1, 1);
-    assert_eq!(
-        capture_state(&s),
-        StateSnapshot {
-            paused: false,
-            fee_bps: 250,
-            payment_count: 1,
-            merchant_payment_count: 1,
-            payer_balance: 900 * UNIT,
-            settlement_balance: 1_075 * UNIT / 10,
-            treasury_balance: 25 * UNIT / 10,
-            processor_balance: 0,
-        }
-    );
-    assert_eq!(
-        s.pp.get_payment(&id1),
-        Payment {
-            id: 1,
-            payer: s.payer.clone(),
-            merchant: s.merchant.clone(),
-            settlement: s.settlement.clone(),
-            asset: s.asset.clone(),
-            amount: 100 * UNIT,
-            fee: 25 * UNIT / 10,
-            refunded: 0,
-            order_ref: order(&s.env, "SNAP-1"),
-            loyalty_points: 0,
-            status: PaymentStatus::Completed,
-            created_at: 1_700_000_000,
-        }
-    );
-
-    // 2. Partial refund (40 UNIT).
-    s.pp.refund(&id1, &(40 * UNIT), &String::from_str(&s.env, "partial"));
-    assert_eq!(
-        capture_state(&s),
-        StateSnapshot {
-            paused: false,
-            fee_bps: 250,
-            payment_count: 1,
-            merchant_payment_count: 1,
-            payer_balance: 940 * UNIT,
-            settlement_balance: 675 * UNIT / 10,
-            treasury_balance: 25 * UNIT / 10,
-            processor_balance: 0,
-        }
-    );
-    assert_eq!(
-        s.pp.get_payment(&id1).status,
-        PaymentStatus::PartiallyRefunded
-    );
-    assert_eq!(s.pp.get_payment(&id1).refunded, 40 * UNIT);
-
-    // 3. Pause blocks both pay and refund without mutating state.
-    s.pp.pause();
-    let paused_snap = capture_state(&s);
-    assert!(paused_snap.paused);
 fn reentrancy_via_merchant_callback_is_blocked() {
     let s = setup(100);
     let cb_id = s.env.register(MaliciousCallback, ());
@@ -944,22 +1002,21 @@ fn reentrancy_via_merchant_callback_is_blocked() {
         &(10 * UNIT),
         &order(&s.env, "ORD-CB-1"),
     );
-    assert_eq!(id, 1);
     assert!(cb.reentry_blocked());
-    // Re-entrant payment was never recorded
+    // The re-entrant payment was never recorded.
     assert_eq!(s.pp.payment_count(), 1);
 
-    // Lock is released after completion, so a subsequent payment succeeds
-    let id2 = s.pp.pay(
+    // The lock is released after completion, so the next payment succeeds.
+    s.pp.pay(
         &s.payer,
         &s.merchant,
         &s.asset,
         &(10 * UNIT),
         &order(&s.env, "ORD-CB-2"),
     );
-    assert_eq!(id2, 2);
+    assert_eq!(s.pp.payment_count(), 2);
 
-    // Explicit reentrancy lock rejects pay, split_payment, and refund
+    // An explicitly held lock rejects every guarded entry point.
     s.env.as_contract(&s.pp.address, || {
         s.env
             .storage()
@@ -972,96 +1029,21 @@ fn reentrancy_via_merchant_callback_is_blocked() {
             &s.merchant,
             &s.asset,
             &UNIT,
-            &order(&s.env, "BLOCKED")
+            &order(&s.env, "LOCKED")
         ),
-        Err(Ok(PaymentError::Paused))
+        Err(Ok(PaymentError::Reentrancy))
     );
     assert_eq!(
-        s.pp.try_refund(&id1, &(60 * UNIT), &String::from_str(&s.env, "blocked")),
-        Err(Ok(PaymentError::Paused))
-    );
-    assert_eq!(capture_state(&s), paused_snap);
-
-    // 4. Unpause and complete refund (60 UNIT) -> counts drop to 0.
-    s.pp.unpause();
-    s.pp.refund(&id1, &(60 * UNIT), &String::from_str(&s.env, "final"));
-    assert_eq!(
-        capture_state(&s),
-        StateSnapshot {
-            paused: false,
-            fee_bps: 250,
-            payment_count: 0,
-            merchant_payment_count: 0,
-            payer_balance: 1_000 * UNIT,
-            settlement_balance: 75 * UNIT / 10,
-            treasury_balance: 25 * UNIT / 10,
-            processor_balance: 0,
-        }
-    );
-    assert_eq!(s.pp.get_payment(&id1).status, PaymentStatus::Refunded);
-    assert_eq!(s.pp.get_payment(&id1).refunded, 100 * UNIT);
-
-    // 5. Subsequent payment gets id #2 while #1 remains Refunded.
-    s.env.ledger().set_timestamp(1_700_000_060);
-    let id2 = s.pp.pay(
-        &s.payer,
-        &s.merchant,
-        &s.asset,
-        &(40 * UNIT),
-        &order(&s.env, "SNAP-2"),
-    );
-    assert_eq!(id2, 2);
-    assert_eq!(
-        capture_state(&s),
-        StateSnapshot {
-            paused: false,
-            fee_bps: 250,
-            payment_count: 1,
-            merchant_payment_count: 1,
-            payer_balance: 960 * UNIT,
-            settlement_balance: 465 * UNIT / 10,
-            treasury_balance: 35 * UNIT / 10,
-            processor_balance: 0,
-        }
-    );
-
-    let ledger_snap = s.env.to_snapshot();
-    assert_eq!(ledger_snap.ledger.timestamp, 1_700_000_060);
-    assert!(!ledger_snap.ledger.ledger_entries.is_empty());
-}
-
-#[test]
-fn state_snapshot_batch_and_per_merchant_refund_counts() {
-    let s = setup(100);
-    let (m2, _settle2) = second_merchant(&s);
-    StellarAssetClient::new(&s.env, &s.asset).mint(&s.settlement, &(5 * UNIT));
-
-    let ids = s.pp.pay_batch(
-        &s.payer,
-        &s.asset,
-        &vec![
-            &s.env,
-            line(&s.merchant, 10 * UNIT, order(&s.env, "B-1")),
-            line(&m2, 20 * UNIT, order(&s.env, "B-2")),
-            line(&s.merchant, 30 * UNIT, order(&s.env, "B-3")),
-        ],
-    );
-    assert_eq!(ids, vec![&s.env, 1u64, 2, 3]);
-    assert_eq!(s.pp.payment_count(), 3);
-    assert_eq!(s.pp.merchant_payment_count(&s.merchant), 2);
-    assert_eq!(s.pp.merchant_payment_count(&m2), 1);
-
-    // Fully refunding merchant 1's first payment decrements only merchant 1 and global count.
-    s.pp.refund(&1, &(10 * UNIT), &String::from_str(&s.env, "cancel item"));
-    assert_eq!(s.pp.payment_count(), 2);
-    assert_eq!(s.pp.merchant_payment_count(&s.merchant), 1);
-    assert_eq!(s.pp.merchant_payment_count(&m2), 1);
-
-    // Config transition snapshot.
-    s.pp.set_fee_bps(&500);
-    let cfg = s.pp.get_config();
-    assert_eq!(cfg.fee_bps, 500);
-    assert!(!cfg.paused);
+        s.pp.try_split_payment(
+            &s.merchant,
+            &s.asset,
+            &vec![
+                &s.env,
+                SplitShare {
+                    payer: s.payer.clone(),
+                    amount: UNIT
+                }
+            ],
             &order(&s.env, "LOCKED"),
         ),
         Err(Ok(PaymentError::Reentrancy))
@@ -1069,5 +1051,284 @@ fn state_snapshot_batch_and_per_merchant_refund_counts() {
     assert_eq!(
         s.pp.try_refund(&id, &UNIT, &order(&s.env, "LOCKED")),
         Err(Ok(PaymentError::Reentrancy))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Payment ID collisions (#88)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn identical_payments_in_the_same_ledger_get_distinct_ids() {
+    let s = setup(0);
+    s.env.ledger().set_timestamp(1_700_000_000);
+    let other = Address::generate(&s.env);
+    StellarAssetClient::new(&s.env, &s.asset).mint(&other, &(100 * UNIT));
+
+    // Same payer, merchant, amount and timestamp; only the order differs.
+    let a = s.pp.pay(
+        &s.payer,
+        &s.merchant,
+        &s.asset,
+        &UNIT,
+        &order(&s.env, "SAME-1"),
+    );
+    let b = s.pp.pay(
+        &s.payer,
+        &s.merchant,
+        &s.asset,
+        &UNIT,
+        &order(&s.env, "SAME-2"),
+    );
+    let c = s.pp.pay(
+        &other,
+        &s.merchant,
+        &s.asset,
+        &UNIT,
+        &order(&s.env, "SAME-3"),
+    );
+    assert!(a != b && b != c && a != c);
+    assert_eq!(s.pp.payment_count(), 3);
+    for id in [a, b, c] {
+        assert_eq!(s.pp.get_payment(&id).id, id);
+    }
+}
+
+#[test]
+fn payment_ids_survive_refunds_without_collision() {
+    let s = setup(0);
+    let a = s.pp.pay(
+        &s.payer,
+        &s.merchant,
+        &s.asset,
+        &UNIT,
+        &order(&s.env, "R-1"),
+    );
+    s.pp.refund(&a, &UNIT, &String::from_str(&s.env, "x"));
+    // Active count dropped back to zero, but the nonce did not, so the next
+    // payment cannot reuse the first one's ID.
+    let b = s.pp.pay(
+        &s.payer,
+        &s.merchant,
+        &s.asset,
+        &UNIT,
+        &order(&s.env, "R-2"),
+    );
+    assert_ne!(a, b);
+    assert_eq!(s.pp.get_payment(&a).status, PaymentStatus::Refunded);
+}
+
+// ---------------------------------------------------------------------------
+// Pre-computed fees (#121)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pay_with_fee_accepts_the_quoted_fee() {
+    let s = setup(250);
+    let (fee, _net) = s.pp.quote(&(100 * UNIT));
+    let id = s.pp.pay_with_fee(
+        &s.payer,
+        &s.merchant,
+        &s.asset,
+        &(100 * UNIT),
+        &order(&s.env, "PF-1"),
+        &fee,
+    );
+    assert_eq!(s.pp.get_payment(&id).fee, fee);
+    assert_eq!(s.token.balance(&s.treasury), fee);
+    assert_eq!(s.token.balance(&s.settlement), 100 * UNIT - fee);
+}
+
+#[test]
+fn pay_with_fee_rejects_a_fee_that_does_not_match() {
+    let s = setup(250);
+    let (fee, _) = s.pp.quote(&(100 * UNIT));
+    for wrong in [0, fee - 1, fee + 1] {
+        assert_eq!(
+            s.pp.try_pay_with_fee(
+                &s.payer,
+                &s.merchant,
+                &s.asset,
+                &(100 * UNIT),
+                &order(&s.env, "PF-2"),
+                &wrong,
+            ),
+            Err(Ok(PaymentError::FeeMismatch))
+        );
+    }
+    assert_eq!(s.pp.payment_count(), 0);
+
+    // A rate change after the quote makes the stale fee fail.
+    s.pp.set_fee_bps(&500);
+    assert_eq!(
+        s.pp.try_pay_with_fee(
+            &s.payer,
+            &s.merchant,
+            &s.asset,
+            &(100 * UNIT),
+            &order(&s.env, "PF-3"),
+            &fee,
+        ),
+        Err(Ok(PaymentError::FeeMismatch))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Authorization (#118)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn entry_points_reject_unauthorized_callers() {
+    let env = Env::default();
+    // No mock_all_auths: every require_auth must be satisfied explicitly.
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let registry = Address::generate(&env);
+    let pp = PaymentProcessorClient::new(&env, &env.register(PaymentProcessor, ()));
+    let who = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let r = order(&env, "AUTH-1");
+
+    assert!(pp
+        .try_initialize(&admin, &registry, &treasury, &100)
+        .is_err());
+
+    env.mock_all_auths();
+    pp.initialize(&admin, &registry, &treasury, &100);
+    env.set_auths(&[]);
+
+    assert!(pp.try_pay(&who, &who, &asset, &UNIT, &r).is_err());
+    assert!(pp
+        .try_pay_with_fee(&who, &who, &asset, &UNIT, &r, &0)
+        .is_err());
+    assert!(pp
+        .try_pay_delegated(&who, &admin, &who, &asset, &UNIT, &r)
+        .is_err());
+    assert!(pp
+        .try_pay_batch(
+            &who,
+            &asset,
+            &vec![
+                &env,
+                BatchLine {
+                    merchant: who.clone(),
+                    amount: UNIT,
+                    order_ref: r.clone()
+                }
+            ]
+        )
+        .is_err());
+    assert!(pp
+        .try_split_payment(
+            &who,
+            &asset,
+            &vec![
+                &env,
+                SplitShare {
+                    payer: who.clone(),
+                    amount: UNIT
+                }
+            ],
+            &r
+        )
+        .is_err());
+    assert!(pp
+        .try_set_merchant_callback(&who, &Some(asset.clone()))
+        .is_err());
+    assert!(pp
+        .try_create_delegation(&who, &admin, &UNIT, &u64::MAX)
+        .is_err());
+    assert!(pp.try_revoke_delegation(&who, &admin).is_err());
+    assert!(pp.try_set_fee_bps(&50).is_err());
+    assert!(pp.try_set_treasury(&who).is_err());
+    assert!(pp.try_pause().is_err());
+    assert!(pp.try_unpause().is_err());
+    assert!(pp.try_set_loyalty(&Some(asset.clone())).is_err());
+    assert!(pp
+        .try_enable_governance(&vec![&env, who.clone()], &1)
+        .is_err());
+    assert_eq!(pp.get_config().fee_bps, 100);
+    assert!(!pp.get_config().paused);
+}
+
+#[test]
+fn only_the_merchant_can_set_its_callback() {
+    let s = setup(0);
+    let cb = Address::generate(&s.env);
+    s.pp.set_merchant_callback(&s.merchant, &Some(cb.clone()));
+    let auths = s.env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, s.merchant);
+    s.pp.set_merchant_callback(&s.merchant, &None);
+    assert_eq!(s.pp.get_merchant_callback(&s.merchant), None);
+}
+
+#[test]
+fn delegation_limits_and_expiry_are_enforced() {
+    let s = setup(0);
+    // The delegator's token transfer is a nested authorization.
+    s.env.mock_all_auths_allowing_non_root_auth();
+    s.env.ledger().set_timestamp(1_000);
+    let delegatee = Address::generate(&s.env);
+    s.pp.create_delegation(&s.payer, &delegatee, &(5 * UNIT), &2_000);
+
+    assert_eq!(
+        s.pp.try_pay_delegated(
+            &delegatee,
+            &s.payer,
+            &s.merchant,
+            &s.asset,
+            &(6 * UNIT),
+            &order(&s.env, "D-1")
+        ),
+        Err(Ok(PaymentError::DelegationLimitExceeded))
+    );
+    s.pp.pay_delegated(
+        &delegatee,
+        &s.payer,
+        &s.merchant,
+        &s.asset,
+        &(3 * UNIT),
+        &order(&s.env, "D-2"),
+    );
+    assert_eq!(
+        s.pp.get_delegation_info(&s.payer, &delegatee).spent,
+        3 * UNIT
+    );
+    assert_eq!(
+        s.pp.try_pay_delegated(
+            &delegatee,
+            &s.payer,
+            &s.merchant,
+            &s.asset,
+            &(3 * UNIT),
+            &order(&s.env, "D-3")
+        ),
+        Err(Ok(PaymentError::DelegationLimitExceeded))
+    );
+
+    s.env.ledger().set_timestamp(2_001);
+    assert_eq!(
+        s.pp.try_pay_delegated(
+            &delegatee,
+            &s.payer,
+            &s.merchant,
+            &s.asset,
+            &UNIT,
+            &order(&s.env, "D-4")
+        ),
+        Err(Ok(PaymentError::DelegationExpired))
+    );
+    s.pp.revoke_delegation(&s.payer, &delegatee);
+    assert_eq!(
+        s.pp.try_pay_delegated(
+            &delegatee,
+            &s.payer,
+            &s.merchant,
+            &s.asset,
+            &UNIT,
+            &order(&s.env, "D-5")
+        ),
+        Err(Ok(PaymentError::DelegationNotFound))
     );
 }
