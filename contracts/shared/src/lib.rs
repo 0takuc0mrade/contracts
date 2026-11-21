@@ -27,17 +27,20 @@ pub const INSTANCE_THRESHOLD: u32 = INSTANCE_BUMP - DAY_IN_LEDGERS;
 pub const PERSISTENT_BUMP: u32 = 90 * DAY_IN_LEDGERS;
 pub const PERSISTENT_THRESHOLD: u32 = PERSISTENT_BUMP - DAY_IN_LEDGERS;
 
-/// Returns `amount * bps / 10_000`, rounded toward zero.
+/// Returns `amount * bps / 10_000`, rounded toward zero and floored at 0.
 ///
 /// Returns `None` on overflow or when `bps` exceeds 100%, so callers can map
-/// it to their own contract error instead of panicking.
+/// it to their own contract error instead of panicking. A negative `amount`
+/// would otherwise produce a negative fee, which callers deduct from the
+/// payout and so overpay the recipient; the result is therefore clamped to 0.
 pub fn bps_of(amount: i128, bps: u32) -> Option<i128> {
     if bps > BPS_DENOMINATOR {
         return None;
     }
-    amount
+    let value = amount
         .checked_mul(bps as i128)?
-        .checked_div(BPS_DENOMINATOR as i128)
+        .checked_div(BPS_DENOMINATOR as i128)?;
+    Some(value.max(0))
 }
 
 /// Splits `amount` into `(fee, net)` where `fee = bps_of(amount, bps)`.
@@ -100,5 +103,21 @@ mod tests {
         let (fee, net) = split_fee(12_345_678, 275).unwrap();
         assert_eq!(fee + net, 12_345_678);
         assert_eq!(fee, 339_506);
+    }
+
+    #[test]
+    fn bps_never_returns_a_negative_fee() {
+        // -1_000 * 250 / 10_000 would divide to -25 without the floor.
+        assert_eq!(bps_of(-1_000, 250), Some(0));
+        assert_eq!(bps_of(-1, 10_000), Some(0));
+        // Small positive amounts that round to zero stay at zero too.
+        assert_eq!(bps_of(1, 500), Some(0));
+    }
+
+    #[test]
+    fn split_fee_does_not_add_a_negative_fee_to_the_payout() {
+        let (fee, net) = split_fee(-1_000, 250).unwrap();
+        assert_eq!(fee, 0);
+        assert_eq!(net, -1_000);
     }
 }
