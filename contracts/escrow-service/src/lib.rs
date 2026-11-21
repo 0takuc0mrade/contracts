@@ -87,9 +87,13 @@ pub struct Dispute {
     /// Arbiter must rule by this time; afterwards the default applies.
     pub deadline: u64,
     /// Buyer share chosen by the arbiter or the default rule, once resolved.
-    pub buyer_bps: Option<u32>,
+    /// `UNRESOLVED` while the dispute is still open.
+    pub buyer_bps: u32,
     pub by_default: bool,
 }
+
+/// Sentinel for "arbiter has not ruled yet".
+const UNRESOLVED: u32 = u32::MAX;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -196,6 +200,17 @@ pub struct DisputeResolved {
     pub by_default: bool,
 }
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectPayment {
+    #[topic]
+    pub buyer: Address,
+    #[topic]
+    pub seller: Address,
+    pub asset: Address,
+    pub amount: i128,
+}
+
 // Build metadata embedded in the wasm (SEP-0055), so anyone can trace a
 // deployed contract back to its source; see scripts/verify.sh.
 soroban_sdk::contractmeta!(key = "source_repo", val = "github:StellarPOS-App/contracts");
@@ -216,6 +231,37 @@ impl EscrowService {
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().set(&DataKey::Count, &0u64);
         extend_instance(&env);
+        Ok(())
+    }
+
+    /// Fast path for immediate direct payments when both buyer and seller
+    /// agree to bypass escrow creation, storage writes, and separate release.
+    pub fn pay_direct(
+        env: Env,
+        buyer: Address,
+        seller: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<(), EscrowError> {
+        Self::require_not_paused(&env)?;
+        if amount <= 0 {
+            return Err(EscrowError::InvalidAmount);
+        }
+        if buyer == seller {
+            return Err(EscrowError::InvalidParties);
+        }
+        buyer.require_auth();
+        seller.require_auth();
+
+        token::Client::new(&env, &asset).transfer(&buyer, &seller, &amount);
+
+        DirectPayment {
+            buyer,
+            seller,
+            asset,
+            amount,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -371,7 +417,7 @@ impl EscrowService {
                 reason,
                 raised_at: now,
                 deadline,
-                buyer_bps: None,
+                buyer_bps: UNRESOLVED,
                 by_default: false,
             },
         );
@@ -497,7 +543,7 @@ impl EscrowService {
         let remaining = escrow.remaining();
         let to_buyer = bps_of(remaining, buyer_bps).ok_or(EscrowError::InvalidSplit)?;
         let to_seller = remaining - to_buyer;
-        dispute.buyer_bps = Some(buyer_bps);
+        dispute.buyer_bps = buyer_bps;
         dispute.by_default = by_default;
         Self::save_dispute(env, escrow.id, &dispute);
         Self::payout(
