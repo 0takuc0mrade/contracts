@@ -87,7 +87,12 @@ fn insured_escrow_funds_pool_and_covers_small_dispute_refund() {
     assert_eq!(s.token.balance(&s.client.address), 1_010);
     s.client
         .raise_dispute(&s.buyer, &id, &DisputeReason::NonDelivery, &None);
-    s.env.ledger().with_mut(|l| l.timestamp = now + 3 * DAY);
+    s.env.ledger().with_mut(|l| {
+        l.timestamp = now + 3 * DAY;
+        l.sequence_number = l
+            .sequence_number
+            .saturating_add((3 * DAY / LEDGER_CLOSE_SECONDS) as u32);
+    });
     s.client.resolve_by_default(&id);
 
     assert_eq!(s.token.balance(&s.buyer), 9_990);
@@ -159,7 +164,9 @@ fn seller_claims_only_after_release_time() {
     let s = setup();
     let id = open(&s, 1_000);
     assert_eq!(s.client.try_claim(&id), Err(Ok(EscrowError::ReleaseNotDue)));
-    s.env.ledger().with_mut(|l| l.timestamp += 3 * DAY);
+    s.env
+        .ledger()
+        .with_mut(|l| l.timestamp += 3 * DAY + SETTLEMENT_GRACE_PERIOD + 1);
     s.client.claim(&id);
     assert_eq!(s.token.balance(&s.seller), 1_000);
 }
