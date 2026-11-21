@@ -46,6 +46,16 @@ jobs:
           files: lcov.info
           fail_ci_if_error: false
 
+  gas-benchmarks:
+    name: gas benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Benchmark escrow creation against CPU and memory limits
+        run: cargo test -p escrow-service gas_benchmarks -- --nocapture
+
   wasm:
     name: build wasm
     runs-on: ubuntu-latest
