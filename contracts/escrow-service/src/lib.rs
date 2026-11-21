@@ -419,7 +419,10 @@ impl EscrowService {
         Self::require_not_paused(&env)?;
         let mut escrow = Self::funded(&env, id)?;
         escrow.seller.require_auth();
-        if env.ledger().timestamp() < escrow.release_at {
+        // The escrow remains live through the exact release ledger close.
+        // A claim is due only strictly after `release_at`, so a transaction at
+        // the boundary is not incorrectly treated as expired (#119).
+        if env.ledger().timestamp() <= escrow.release_at {
             return Err(EscrowError::ReleaseNotDue);
         }
         let amount = escrow.remaining();
@@ -460,7 +463,7 @@ impl EscrowService {
         // dispute any time while funded, to get a ruling sooner than
         // release_at (e.g. a buyer blocking a partial release).
         let window_open = match role {
-            PartyRole::Buyer => now < escrow.release_at,
+            PartyRole::Buyer => now <= escrow.release_at,
             PartyRole::Seller => true,
         };
         if !window_open {
