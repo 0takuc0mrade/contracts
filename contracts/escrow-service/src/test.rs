@@ -70,6 +70,57 @@ fn create_moves_funds_into_escrow() {
 }
 
 #[test]
+fn insured_escrow_funds_pool_and_covers_small_dispute_refund() {
+    let s = setup();
+    let now = s.env.ledger().timestamp();
+    let id = s.client.create_insured(
+        &s.buyer,
+        &s.seller,
+        &s.arbiter,
+        &s.asset,
+        &1_000,
+        &(now + 3 * DAY),
+        &(2 * DAY),
+    );
+
+    assert_eq!(s.client.insurance_balance(&s.asset), 10);
+    assert_eq!(s.token.balance(&s.client.address), 1_010);
+    s.client
+        .raise_dispute(&s.buyer, &id, &DisputeReason::NonDelivery, &None);
+    s.env.ledger().with_mut(|l| l.timestamp = now + 3 * DAY);
+    s.client.resolve_by_default(&id);
+
+    assert_eq!(s.token.balance(&s.buyer), 9_990);
+    assert_eq!(s.token.balance(&s.seller), 10);
+    assert_eq!(s.client.insurance_balance(&s.asset), 0);
+}
+
+#[test]
+fn gas_benchmarks_create_escrow_within_thresholds() {
+    let s = setup();
+    let now = s.env.ledger().timestamp();
+    s.client.create(
+        &s.buyer,
+        &s.seller,
+        &s.arbiter,
+        &s.asset,
+        &1_000,
+        &(now + 3 * DAY),
+        &(2 * DAY),
+    );
+
+    let budget = s.env.cost_estimate().budget();
+    let cpu = budget.cpu_instruction_cost();
+    let memory = budget.memory_bytes_cost();
+    std::println!("create_escrow cpu={cpu} memory={memory}");
+    assert!(cpu <= 50_000_000, "create_escrow CPU regression: {cpu}");
+    assert!(
+        memory <= 5_000_000,
+        "create_escrow memory regression: {memory}"
+    );
+}
+
+#[test]
 fn buyer_release_pays_seller() {
     let s = setup();
     let id = open(&s, 1_000);
