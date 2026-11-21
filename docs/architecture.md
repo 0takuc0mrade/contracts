@@ -68,9 +68,10 @@ check cheap.
 | `Payment(id)` | persistent | full payment record |
 | `Order(merchant, order_ref)` | persistent | payment id (the idempotency index) |
 
-**Fees.** `fee = amount * fee_bps / 10_000`, rounded toward zero, capped at
-`MAX_FEE_BPS = 1000` (10%). `quote(amount)` returns `(fee, net)` for checkout
-previews.
+**Fees.** `fee = amount * fee_bps / 10_000`, rounded toward zero and floored
+at 0, capped at `MAX_FEE_BPS = 1000` (10%). `quote(amount)` returns
+`(fee, net)` for checkout previews. The floor means a computed fee can never
+be negative and so can never be deducted as a payout bonus.
 
 **Refunds** are authorized by the payment's settlement account, because that
 account holds the funds. A refund can be partial and repeated, up to the gross
