@@ -104,7 +104,7 @@ fn arbiter_splits_funds() {
 
     assert_eq!(w.escrow.get_escrow(&w.id).status, EscrowStatus::Resolved);
     let d = w.escrow.get_dispute(&w.id);
-    assert_eq!(d.buyer_bps, Some(3_000));
+    assert_eq!(d.buyer_bps, 3_000);
     assert!(!d.by_default);
 }
 
