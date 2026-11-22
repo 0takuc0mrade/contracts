@@ -40,12 +40,8 @@ use soroban_sdk::{
 pub const MAX_ORDER_REF_LEN: u32 = 64;
 /// Most payments in one pay_batch call, to stay well inside resource limits.
 pub const MAX_BATCH: u32 = 20;
-/// Most royalty recipients on one payment.
-pub const MAX_ROYALTY_RECIPIENTS: u32 = 5;
-/// Largest governance council.
-pub const MAX_COUNCIL: u32 = 10;
-/// Most contributing buyers in one split_payment call.
-pub const MAX_SPLITS: u32 = 20;
+/// Contract version for tracking deployed releases.
+pub const VERSION: &str = "1.0.0";
 
 /// The subset of the merchant registry this contract calls.
 #[allow(dead_code)]
@@ -102,12 +98,7 @@ pub enum PaymentError {
     AlreadyApproved = 20,
  stellar-fixes-consolidated
     ExpiredLedgerEntry = 14,
-
-    /// The token did not credit the recipient with the amount transferred.
-    TransferFailed = 14,
-    InvalidSplit = 14,
-    Reentrancy = 15,
- main
+    CircuitBreakerTriggered = 15,
 }
 
 #[contracttype]
@@ -210,6 +201,13 @@ enum DataKey {
     Delegation(Address, Address),
     RecurringCount,
     RecurringPayment(u64),
+    CircuitBreakerMaxTx,
+    CircuitBreakerMaxVolume,
+    CircuitBreakerLastLedger,
+    CircuitBreakerCurrentVolume,
+    FeesCollected,
+    FeeSweepLastLedger,
+    FeeSweepInterval,
 }
 
 #[contractevent]
@@ -361,6 +359,23 @@ pub struct RecurringPaymentCancelled {
     pub recurring_id: u64,
 }
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CircuitBreakerTriggered {
+    pub reason: String,
+    pub transaction_amount: i128,
+    pub volume_this_ledger: i128,
+    pub ledger_number: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeSwept {
+    pub amount: i128,
+    pub treasury: Address,
+    pub ledger_number: u32,
+}
+
 // Build metadata embedded in the wasm (SEP-0055), so anyone can trace a
 // deployed contract back to its source; see scripts/verify.sh.
 soroban_sdk::contractmeta!(key = "source_repo", val = "github:StellarPOS-App/contracts");
@@ -406,6 +421,13 @@ impl PaymentProcessor {
         env.storage().instance().set(&DataKey::NextPaymentId, &0u64);
         storage.set(&DataKey::Config, &config);
         storage.set(&DataKey::PaymentCount, &0u64);
+        storage.set(&DataKey::CircuitBreakerMaxTx, &i128::MAX);
+        storage.set(&DataKey::CircuitBreakerMaxVolume, &i128::MAX);
+        storage.set(&DataKey::CircuitBreakerLastLedger, &0u32);
+        storage.set(&DataKey::CircuitBreakerCurrentVolume, &0i128);
+        storage.set(&DataKey::FeesCollected, &0i128);
+        storage.set(&DataKey::FeeSweepLastLedger, &0u32);
+        storage.set(&DataKey::FeeSweepInterval, &(7 * shared::DAY_IN_LEDGERS as u32));
         extend_instance(&env);
         Ok(())
     }
@@ -443,6 +465,7 @@ impl PaymentProcessor {
         if discount < 0 || discount > amount {
             return Err(PaymentError::InvalidAmount);
         }
+        Self::check_circuit_breaker(&env, amount)?;
         let settlement = Self::settlement_for(&env, &config, &merchant, &asset)?;
         Self::settle(
             &env, &config, &payer, merchant, settlement, &asset, amount, order_ref, discount,
@@ -481,6 +504,7 @@ impl PaymentProcessor {
         if discount < 0 || discount > amount {
             return Err(PaymentError::InvalidAmount);
         }
+        Self::check_circuit_breaker(&env, amount)?;
         let delegatee = env.current_contract_address();
         let mut delegation = Self::get_delegation(&env, &delegator, &delegatee)?;
 
@@ -575,6 +599,11 @@ impl PaymentProcessor {
             return Err(PaymentError::InvalidBatch);
         }
         payer.require_auth();
+
+        // Check circuit breaker for each transaction
+        for line in lines.iter() {
+            Self::check_circuit_breaker(&env, line.amount)?;
+        }
 
         // Look each merchant up once, however many lines it has.
         let mut targets: Map<Address, Address> = Map::new(&env);
@@ -905,6 +934,100 @@ impl PaymentProcessor {
         Self::update(&env, |c| c.paused = false)
     }
 
+    /// Sets the circuit breaker threshold for maximum single transaction amount.
+    pub fn set_circuit_breaker_max_single_tx(env: Env, max_amount: i128) -> Result<(), PaymentError> {
+        if max_amount <= 0 {
+            return Err(PaymentError::InvalidAmount);
+        }
+        let config = Self::config(&env)?;
+        config.admin.require_auth();
+        env.storage().instance().set(&DataKey::CircuitBreakerMaxTx, &max_amount);
+        extend_instance(&env);
+        Ok(())
+    }
+
+    /// Sets the circuit breaker threshold for maximum volume per ledger.
+    pub fn set_circuit_breaker_max_volume(env: Env, max_volume: i128) -> Result<(), PaymentError> {
+        if max_volume <= 0 {
+            return Err(PaymentError::InvalidAmount);
+        }
+        let config = Self::config(&env)?;
+        config.admin.require_auth();
+        env.storage().instance().set(&DataKey::CircuitBreakerMaxVolume, &max_volume);
+        extend_instance(&env);
+        Ok(())
+    }
+
+    /// Resets the circuit breaker volume counter (admin only).
+    pub fn reset_circuit_breaker(env: Env) -> Result<(), PaymentError> {
+        let config = Self::config(&env)?;
+        config.admin.require_auth();
+        env.storage().instance().set(&DataKey::CircuitBreakerCurrentVolume, &0i128);
+        env.storage().instance().set(&DataKey::CircuitBreakerLastLedger, &env.ledger().sequence());
+        extend_instance(&env);
+        Ok(())
+    }
+
+    /// Sets the fee sweep interval in ledgers (admin only).
+    pub fn set_fee_sweep_interval(env: Env, interval_ledgers: u32) -> Result<(), PaymentError> {
+        if interval_ledgers == 0 {
+            return Err(PaymentError::InvalidOrderRef);
+        }
+        let config = Self::config(&env)?;
+        config.admin.require_auth();
+        env.storage().instance().set(&DataKey::FeeSweepInterval, &interval_ledgers);
+        extend_instance(&env);
+        Ok(())
+    }
+
+    /// Sweeps accumulated fees to the treasury if the interval has passed.
+    pub fn sweep_fees(env: Env) -> Result<(), PaymentError> {
+        let config = Self::config(&env)?;
+        let storage = env.storage().instance();
+        let current_ledger = env.ledger().sequence();
+        let last_sweep: u32 = storage.get(&DataKey::FeeSweepLastLedger).unwrap_or(0);
+        let sweep_interval: u32 = storage.get(&DataKey::FeeSweepInterval).unwrap_or(7 * shared::DAY_IN_LEDGERS as u32);
+        let fees_collected: i128 = storage.get(&DataKey::FeesCollected).unwrap_or(0);
+
+        if fees_collected <= 0 {
+            return Ok(());
+        }
+
+        if current_ledger.saturating_sub(last_sweep) < sweep_interval {
+            return Ok(());
+        }
+
+        storage.set(&DataKey::FeesCollected, &0i128);
+        storage.set(&DataKey::FeeSweepLastLedger, &current_ledger);
+        extend_instance(&env);
+
+        FeeSwept {
+            amount: fees_collected,
+            treasury: config.treasury,
+            ledger_number: current_ledger,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Returns the total fees collected (pending sweep).
+    pub fn get_fees_collected(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeesCollected)
+            .unwrap_or(0)
+    }
+
+    /// Returns the current circuit breaker settings: (max_tx, max_volume, last_ledger_checked).
+    pub fn get_circuit_breaker_settings(env: Env) -> (i128, i128, u32) {
+        let storage = env.storage().instance();
+        let max_tx = storage.get(&DataKey::CircuitBreakerMaxTx).unwrap_or(i128::MAX);
+        let max_volume = storage.get(&DataKey::CircuitBreakerMaxVolume).unwrap_or(i128::MAX);
+        let last_ledger = storage.get(&DataKey::CircuitBreakerLastLedger).unwrap_or(0);
+        (max_tx, max_volume, last_ledger)
+    }
+
     // ---------------------------------------------------------------------
     // Delegation Management
     // ---------------------------------------------------------------------
@@ -1222,8 +1345,9 @@ impl PaymentProcessor {
         Self::config(&env)
     }
 
-    pub fn get_loyalty(env: Env) -> Option<Address> {
-        env.storage().instance().get(&DataKey::Loyalty)
+    /// Returns the contract version.
+    pub fn get_version(_env: Env) -> String {
+        String::from_slice(&_env, VERSION.as_bytes())
     }
 
     /// Fee and net split for a prospective payment, for checkout previews.
@@ -1237,6 +1361,53 @@ impl PaymentProcessor {
     // ---------------------------------------------------------------------
     // Internals
     // ---------------------------------------------------------------------
+
+    /// Checks circuit breaker thresholds. Returns error if limits exceeded.
+    fn check_circuit_breaker(env: &Env, amount: i128) -> Result<(), PaymentError> {
+        let storage = env.storage().instance();
+        let current_ledger = env.ledger().sequence();
+        let max_tx: i128 = storage.get(&DataKey::CircuitBreakerMaxTx).unwrap_or(i128::MAX);
+        let max_volume: i128 = storage.get(&DataKey::CircuitBreakerMaxVolume).unwrap_or(i128::MAX);
+        let last_ledger: u32 = storage.get(&DataKey::CircuitBreakerLastLedger).unwrap_or(0);
+        let mut current_volume: i128 = storage.get(&DataKey::CircuitBreakerCurrentVolume).unwrap_or(0);
+
+        // Check single transaction limit
+        if amount > max_tx {
+            CircuitBreakerTriggered {
+                reason: String::from_slice(env, b"Single transaction exceeds limit"),
+                transaction_amount: amount,
+                volume_this_ledger: current_volume,
+                ledger_number: current_ledger,
+            }
+            .publish(env);
+            Self::update(env, |c| c.paused = true)?;
+            return Err(PaymentError::CircuitBreakerTriggered);
+        }
+
+        // Reset volume counter if we're in a new ledger
+        if current_ledger != last_ledger {
+            current_volume = 0;
+        }
+
+        // Check cumulative volume limit
+        let new_volume = current_volume.checked_add(amount).ok_or(PaymentError::Overflow)?;
+        if new_volume > max_volume {
+            CircuitBreakerTriggered {
+                reason: String::from_slice(env, b"Ledger volume exceeds limit"),
+                transaction_amount: amount,
+                volume_this_ledger: new_volume,
+                ledger_number: current_ledger,
+            }
+            .publish(env);
+            Self::update(env, |c| c.paused = true)?;
+            return Err(PaymentError::CircuitBreakerTriggered);
+        }
+
+        storage.set(&DataKey::CircuitBreakerCurrentVolume, &new_volume);
+        storage.set(&DataKey::CircuitBreakerLastLedger, &current_ledger);
+        extend_instance(env);
+        Ok(())
+    }
 
     /// One registry call: the merchant's settlement account if it is active
     /// and accepts `asset`.
@@ -1303,7 +1474,11 @@ impl PaymentProcessor {
         let client = token::Client::new(env, asset);
         Self::transfer_checked(&client, payer, &settlement, net)?;
         if fee > 0 {
-            Self::transfer_checked(&client, payer, &config.treasury, fee)?;
+            token.transfer(payer, &config.treasury, &fee);
+            let storage = env.storage().instance();
+            let mut collected: i128 = storage.get(&DataKey::FeesCollected).unwrap_or(0);
+            collected = collected.checked_add(fee).ok_or(PaymentError::Overflow)?;
+            storage.set(&DataKey::FeesCollected, &collected);
         }
 
         let loyalty_points = match env.storage().instance().get::<_, Address>(&DataKey::Loyalty) {
