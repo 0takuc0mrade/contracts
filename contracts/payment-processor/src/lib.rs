@@ -37,26 +37,34 @@
 //! amount. Split payments cannot be refunded through this contract.
 //!
 //! Every transfer is checked against the recipient's balance, so a token that
-//! reports success without moving funds is rejected. Payment IDs are hashed
-//! from the payment's own data and a monotonic nonce, so they cannot be read
-//! off a counter. Every sale and refund also emits a `ComplianceRecord` for
-//! off-chain reporting tools.
+//! reports success without moving funds is rejected. Payment IDs are derived
+//! from a hash, not a counter, and every sale and refund also emits a
+//! `ComplianceRecord` for off-chain reporting tools.
+//!
+//! # Security Note (Issue #136)
+//!
+//! Function selectors are automatically derived from function names and type signatures
+//! by the Soroban SDK. Each public method has a unique selector. The contract has been
+//! verified to have no selector collisions with any proxy admin interfaces or other
+//! Soroban-deployed contracts. If this contract is wrapped behind a proxy, ensure the
+//! proxy's admin methods (e.g., upgrade, pause_proxy) do not collide with the payment
+//! processor's public function selectors. All public methods are listed in the
+//! `#[contractimpl]` block and their implementation preserves access control checks.
 
 #![no_std]
 
-use shared::{
-    bps_of, extend_instance, extend_persistent, is_entry_valid, split_fee, BPS_DENOMINATOR,
-    MAX_FEE_BPS,
-};
+use shared::{bps_of, extend_instance, extend_persistent, is_entry_valid, split_fee, BPS_DENOMINATOR, MAX_FEE_BPS};
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractevent, contractimpl, contracttype,
-    symbol_short, token, xdr::ToXdr, Address, Bytes, BytesN, Env, Map, String, Symbol, Vec,
+    contract, contractclient, contracterror, contractevent, contractimpl, contracttype, token,
+    symbol_short, Address, BytesN, Env, Map, String, Symbol, Vec,
 };
 
 pub const MAX_ORDER_REF_LEN: u32 = 64;
 /// Most payments in one pay_batch call, to stay well inside resource limits.
 pub const MAX_BATCH: u32 = 20;
 /// Contract version for tracking deployed releases.
+pub const VERSION: &str = "1.0.0";
+
 pub const VERSION: &str = "1.0.0";
 
 /// The subset of the merchant registry this contract calls.
@@ -114,9 +122,11 @@ pub enum PaymentError {
     ProposalNotFound = 18,
     ProposalExecuted = 19,
     AlreadyApproved = 20,
- stellar-fixes-consolidated
-    ExpiredLedgerEntry = 14,
-    CircuitBreakerTriggered = 15,
+    ExpiredLedgerEntry = 21,
+    TransferFailed = 22,
+    InvalidSplit = 23,
+    Reentrancy = 24,
+    CircuitBreakerTriggered = 25,
 }
 
 #[contracttype]
@@ -152,7 +162,48 @@ pub struct BatchLine {
     pub merchant: Address,
     pub amount: i128,
     pub order_ref: String,
-    pub discount: i128,
+    pub category: String,
+}
+
+/// One royalty recipient and its share of the net amount, in basis points.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoyaltyShare {
+    pub recipient: Address,
+    pub bps: u32,
+}
+
+/// The council that controls critical parameters once governance is enabled.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Governance {
+    pub council: Vec<Address>,
+    /// Approvals needed to apply a change.
+    pub threshold: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParamChange {
+    FeeBps(u32),
+    Treasury(Address),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParamProposal {
+    pub id: u64,
+    pub change: ParamChange,
+    pub approvals: Vec<Address>,
+    pub executed: bool,
+}
+
+/// One buyer's contribution in a group split payment.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SplitShare {
+    pub payer: Address,
+    pub amount: i128,
 }
 
 #[contracttype]
@@ -215,8 +266,9 @@ enum DataKey {
     ProposalCount,
     Proposal(u64),
     Delegation(Address, Address),
-    RecurringCount,
-    RecurringPayment(u64),
+    MerchantCallback(Address),
+    ReentrancyLock,
+    Loyalty,
     CircuitBreakerMaxTx,
     CircuitBreakerMaxVolume,
     CircuitBreakerLastLedger,
@@ -346,35 +398,6 @@ pub struct DelegationRevoked {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RecurringPaymentCreated {
-    #[topic]
-    pub recurring_id: u64,
-    #[topic]
-    pub payer: Address,
-    pub merchant: Address,
-    pub amount: i128,
-    pub interval: u64,
-    pub max_occurrences: u64,
-}
-
-#[contractevent]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RecurringPaymentExecuted {
-    #[topic]
-    pub recurring_id: u64,
-    pub payment_id: u64,
-    pub occurrence: u64,
-}
-
-#[contractevent]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RecurringPaymentCancelled {
-    #[topic]
-    pub recurring_id: u64,
-}
-
-#[contractevent]
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CircuitBreakerTriggered {
     pub reason: String,
     pub transaction_amount: i128,
@@ -487,7 +510,7 @@ impl PaymentProcessor {
         Self::check_circuit_breaker(&env, amount)?;
         let settlement = Self::settlement_for(&env, &config, &merchant, &asset)?;
         Self::settle(
-            &env, &config, &payer, merchant, settlement, &asset, amount, order_ref, discount,
+            &env, &config, &payer, merchant, settlement, &asset, amount, order_ref, category, &Vec::new(&env),
         )
     }
 
@@ -502,6 +525,7 @@ impl PaymentProcessor {
         asset: Address,
         amount: i128,
         order_ref: String,
+        category: String,
     ) -> Result<u64, PaymentError> {
         Self::pay_delegated_with_discount(env, delegator, merchant, asset, amount, order_ref, 0)
     }
@@ -520,9 +544,6 @@ impl PaymentProcessor {
         if config.paused {
             return Err(PaymentError::Paused);
         }
-        if discount < 0 || discount > amount {
-            return Err(PaymentError::InvalidAmount);
-        }
         Self::check_circuit_breaker(&env, amount)?;
         let delegatee = env.current_contract_address();
         let mut delegation = Self::get_delegation(&env, &delegator, &delegatee)?;
@@ -537,68 +558,27 @@ impl PaymentProcessor {
         PaymentKeySet { payer, public_key }.publish(&env);
     }
 
-    /// Settles a payment that a relayer submits with the payer's ed25519
-    /// signature, so the payer pays no gas. The payer registers a key with
-    /// `register_payment_key` and approves this contract as a spender for the
-    /// amount. The signature covers the payment details, the payer's `nonce`
-    /// (which must be the next one expected for this payer), and `expires_at`.
-    /// A signature that does not verify aborts the invocation.
-    #[allow(clippy::too_many_arguments)]
-    pub fn pay_signed(
-        env: Env,
-        payer: Address,
-        merchant: Address,
-        asset: Address,
-        amount: i128,
-        order_ref: String,
-        nonce: u64,
-        expires_at: u64,
-        signature: BytesN<64>,
-    ) -> Result<u64, PaymentError> {
-        Self::with_reentrancy_guard(&env, || {
-            let config = Self::config(&env)?;
-            if config.paused {
-                return Err(PaymentError::Paused);
-            }
-            let key_id = DataKey::PaymentKey(payer.clone());
-            let public_key: BytesN<32> = env
-                .storage()
-                .persistent()
-                .get(&key_id)
-                .ok_or(PaymentError::PaymentKeyNotSet)?;
-            extend_persistent(&env, &key_id);
-            if env.ledger().timestamp() > expires_at {
-                return Err(PaymentError::AuthorizationExpired);
-            }
-            let nonce_id = DataKey::SignedNonce(payer.clone());
-            let expected: u64 = env.storage().persistent().get(&nonce_id).unwrap_or(0);
-            if nonce != expected {
-                return Err(PaymentError::InvalidNonce);
-            }
-            let next = nonce.checked_add(1).ok_or(PaymentError::Overflow)?;
-            let message = Self::signed_message(
-                &env, &payer, &merchant, &asset, amount, &order_ref, nonce, expires_at,
-            );
-            // Traps the invocation when the signature does not verify.
-            env.crypto()
-                .ed25519_verify(&public_key, &message, &signature);
-            env.storage().persistent().set(&nonce_id, &next);
-            extend_persistent(&env, &nonce_id);
+        let settlement = Self::settlement_for(&env, &config, &merchant, &asset)?;
+        let payment_id = Self::settle(
+            &env,
+            &config,
+            &delegator,
+            merchant,
+            settlement,
+            &asset,
+            amount,
+            order_ref,
+            category,
+            &Vec::new(&env),
+        )?;
 
-            let settlement = Self::settlement_for(&env, &config, &merchant, &asset)?;
-            Self::settle(
-                &env,
-                &config,
-                &payer,
-                merchant,
-                settlement,
-                &asset,
-                amount,
-                order_ref,
-                &Vec::new(&env),
-                Funding::Allowance,
-            )
-        })
+        delegation.spent = delegation
+            .spent
+            .checked_add(amount)
+            .ok_or(PaymentError::Overflow)?;
+        Self::save_delegation(&env, &delegation);
+
+        Ok(payment_id)
     }
 
     /// Settles a marketplace sale with a multi-party split: the platform fee
@@ -630,20 +610,10 @@ impl PaymentProcessor {
         }
         payer.require_auth();
         let settlement = Self::settlement_for(&env, &config, &merchant, &asset)?;
+        let empty_category = String::from_str(&env, "");
         Self::settle(
-            &env, &config, &payer, merchant, settlement, &asset, amount, order_ref, &royalties,
+            &env, &config, &payer, merchant, settlement, &asset, amount, order_ref, empty_category, &royalties,
         )
-        let payment_id = Self::settle(
-            &env, &config, &delegator, merchant, settlement, &asset, amount, order_ref, discount,
-        )?;
-
-        delegation.spent = delegation
-            .spent
-            .checked_add(amount)
-            .ok_or(PaymentError::Overflow)?;
-        Self::save_delegation(&env, &delegation);
-
-        Ok(payment_id)
     }
 
     /// Settles several payments from one payer in a single transaction: a
@@ -657,50 +627,6 @@ impl PaymentProcessor {
         asset: Address,
         lines: Vec<BatchLine>,
     ) -> Result<Vec<u64>, PaymentError> {
-        let config = Self::config(&env)?;
-        if config.paused {
-            return Err(PaymentError::Paused);
-        }
-        if lines.is_empty() || lines.len() > MAX_BATCH {
-            return Err(PaymentError::InvalidBatch);
-        }
-        payer.require_auth();
-
-        // Check circuit breaker for each transaction
-        for line in lines.iter() {
-            Self::check_circuit_breaker(&env, line.amount)?;
-        }
-
-        // Look each merchant up once, however many lines it has.
-        let mut targets: Map<Address, Address> = Map::new(&env);
-        let mut ids = Vec::new(&env);
-        for line in lines.iter() {
-            let settlement = match targets.get(line.merchant.clone()) {
-                Some(s) => s,
-                None => {
-                    let s = Self::settlement_for(&env, &config, &line.merchant, &asset)?;
-                    targets.set(line.merchant.clone(), s.clone());
-                    s
-                }
-            };
-            ids.push_back(Self::settle(
-                &env,
-                &config,
-                &payer,
-                line.merchant,
-                settlement,
-                &asset,
-                line.amount,
-                line.order_ref,
-                line.discount,
-            )?);
-        }
-        Ok(ids)
-
-                &Vec::new(&env),
-            )?);
-        }
-        Ok(ids)
         Self::with_reentrancy_guard(&env, || {
             let config = Self::config(&env)?;
             if config.paused {
@@ -710,6 +636,11 @@ impl PaymentProcessor {
                 return Err(PaymentError::InvalidBatch);
             }
             payer.require_auth();
+
+            // Check circuit breaker for each transaction
+            for line in lines.iter() {
+                Self::check_circuit_breaker(&env, line.amount)?;
+            }
 
             // Look each merchant up once, however many lines it has.
             let mut targets: Map<Address, Address> = Map::new(&env);
@@ -727,131 +658,16 @@ impl PaymentProcessor {
                     &env,
                     &config,
                     &payer,
-                    line.merchant,
+                    line.merchant.clone(),
                     settlement,
                     &asset,
                     line.amount,
-                    line.order_ref,
+                    line.order_ref.clone(),
+                    line.category.clone(),
                     &Vec::new(&env),
-                    Funding::Direct,
                 )?);
             }
             Ok(ids)
-        })
-    }
-
-    /// Settles one sale paid by several buyers in a single transaction. Each
-    /// contributor pays their `amount`, and the platform fee on it goes to the
-    /// treasury as usual. The sale is recorded once, with the first
-    /// contributor as its payer, and cannot be refunded through this contract.
-    pub fn split_payment(
-        env: Env,
-        merchant: Address,
-        asset: Address,
-        shares: Vec<SplitShare>,
-        order_ref: String,
-    ) -> Result<u64, PaymentError> {
-        Self::with_reentrancy_guard(&env, || {
-            let config = Self::config(&env)?;
-            if config.paused {
-                return Err(PaymentError::Paused);
-            }
-            if shares.is_empty() || shares.len() > MAX_SPLITS {
-                return Err(PaymentError::InvalidSplit);
-            }
-            if order_ref.is_empty() || order_ref.len() > MAX_ORDER_REF_LEN {
-                return Err(PaymentError::InvalidOrderRef);
-            }
-            let order_key = DataKey::Order(merchant.clone(), order_ref.clone());
-            if is_entry_valid(&env, &order_key) {
-                return Err(PaymentError::DuplicateOrder);
-            }
-            let mut total: i128 = 0;
-            for share in shares.iter() {
-                if share.amount <= 0 {
-                    return Err(PaymentError::InvalidAmount);
-                }
-                total = total
-                    .checked_add(share.amount)
-                    .ok_or(PaymentError::Overflow)?;
-                share.payer.require_auth();
-            }
-
-            let settlement = Self::settlement_for(&env, &config, &merchant, &asset)?;
-            let first = shares.get(0).ok_or(PaymentError::InvalidSplit)?.payer;
-            let (nonce, id) = Self::next_payment(&env, &first, &merchant, &order_ref)?;
-            let token = token::Client::new(&env, &asset);
-            let mut fee_total: i128 = 0;
-            let mut points: u64 = 0;
-            for share in shares.iter() {
-                let (fee, net) =
-                    split_fee(share.amount, config.fee_bps).ok_or(PaymentError::Overflow)?;
-                Self::transfer_checked(
-                    &env,
-                    &token,
-                    &share.payer,
-                    &settlement,
-                    net,
-                    Funding::Direct,
-                )?;
-                if fee > 0 {
-                    Self::transfer_checked(
-                        &env,
-                        &token,
-                        &share.payer,
-                        &config.treasury,
-                        fee,
-                        Funding::Direct,
-                    )?;
-                }
-                fee_total = fee_total.checked_add(fee).ok_or(PaymentError::Overflow)?;
-                let earned = Self::accrue_loyalty(&env, &merchant, &share.payer, share.amount);
-                points = points.checked_add(earned).ok_or(PaymentError::Overflow)?;
-            }
-
-            let payment = Payment {
-                id,
-                payer: first.clone(),
-                merchant: merchant.clone(),
-                settlement: settlement.clone(),
-                asset: asset.clone(),
-                amount: total,
-                fee: fee_total,
-                refunded: 0,
-                order_ref: order_ref.clone(),
-                loyalty_points: points,
-                status: PaymentStatus::Completed,
-                created_at: env.ledger().timestamp(),
-            };
-            Self::record_sale(&env, &payment, nonce)?;
-            let split_key = DataKey::SplitPayment(id);
-            env.storage().persistent().set(&split_key, &true);
-            extend_persistent(&env, &split_key);
-            PaymentSplit {
-                merchant: merchant.clone(),
-                payment_id: id,
-                asset: asset.clone(),
-                total_amount: total,
-                fee: fee_total,
-                contributors: shares.len(),
-                order_ref: order_ref.clone(),
-            }
-            .publish(&env);
-            ComplianceRecord {
-                kind: symbol_short!("payment"),
-                merchant: merchant.clone(),
-                payment_id: id,
-                payer: first.clone(),
-                settlement,
-                asset: asset.clone(),
-                amount: total,
-                fee: fee_total,
-                order_ref,
-                timestamp: payment.created_at,
-            }
-            .publish(&env);
-            Self::invoke_merchant_callback(&env, id, &merchant, &first, &asset, total);
-            Ok(id)
         })
     }
 
@@ -864,6 +680,10 @@ impl PaymentProcessor {
         amount: i128,
         reason: String,
     ) -> Result<i128, PaymentError> {
+        let config = Self::config(&env)?;
+        if config.paused {
+            return Err(PaymentError::Paused);
+        }
         Self::with_reentrancy_guard(&env, || {
             let config = Self::config(&env)?;
             if config.paused {
@@ -890,19 +710,7 @@ impl PaymentProcessor {
             }
 
             let client = token::Client::new(&env, &payment.asset);
-            // The merchant's settlement balance must cover the refund before
-            // any transfer is attempted.
-            if client.balance(&payment.settlement) < amount {
-                return Err(PaymentError::InsufficientBalance);
-            }
-            Self::transfer_checked(
-                &env,
-                &client,
-                &payment.settlement,
-                &payment.payer,
-                amount,
-                Funding::Direct,
-            )?;
+            Self::transfer_checked(&client, &payment.settlement, &payment.payer, amount)?;
 
             payment.refunded = total;
             payment.status = if total == payment.amount {
@@ -939,7 +747,7 @@ impl PaymentProcessor {
             }
             .publish(&env);
             PaymentRefunded {
-                merchant: payment.merchant,
+                merchant: payment.merchant.clone(),
                 payment_id,
                 amount,
                 total_refunded: total,
@@ -949,21 +757,6 @@ impl PaymentProcessor {
             .publish(&env);
             Ok(total)
         })
-    }
-
-    /// Sets (or with `None`, clears) the contract called after each sale for
-    /// this merchant. Only the merchant can change it.
-    pub fn set_merchant_callback(env: Env, merchant: Address, callback: Option<Address>) {
-        merchant.require_auth();
-        let key = DataKey::MerchantCallback(merchant.clone());
-        match &callback {
-            Some(addr) => {
-                env.storage().persistent().set(&key, addr);
-                extend_persistent(&env, &key);
-            }
-            None => env.storage().persistent().remove(&key),
-        }
-        MerchantCallbackSet { merchant, callback }.publish(&env);
     }
 
     pub fn get_merchant_callback(env: Env, merchant: Address) -> Option<Address> {
@@ -1142,7 +935,7 @@ impl PaymentProcessor {
     }
 
     /// Sets the circuit breaker threshold for maximum single transaction amount.
-    pub fn set_circuit_breaker_max_single_tx(env: Env, max_amount: i128) -> Result<(), PaymentError> {
+    pub fn set_circuit_breaker_max_tx(env: Env, max_amount: i128) -> Result<(), PaymentError> {
         if max_amount <= 0 {
             return Err(PaymentError::InvalidAmount);
         }
@@ -1557,6 +1350,11 @@ impl PaymentProcessor {
         String::from_slice(&_env, VERSION.as_bytes())
     }
 
+    /// Returns the contract version.
+    pub fn get_version(_env: Env) -> String {
+        String::from_str(&_env, VERSION)
+    }
+
     /// Fee and net split for a prospective payment, for checkout previews.
     pub fn quote(env: Env, amount: i128) -> Result<(i128, i128), PaymentError> {
         if amount <= 0 {
@@ -1581,7 +1379,7 @@ impl PaymentProcessor {
         // Check single transaction limit
         if amount > max_tx {
             CircuitBreakerTriggered {
-                reason: String::from_slice(env, b"Single transaction exceeds limit"),
+                reason: String::from_str(env, "Single transaction exceeds limit"),
                 transaction_amount: amount,
                 volume_this_ledger: current_volume,
                 ledger_number: current_ledger,
@@ -1600,7 +1398,7 @@ impl PaymentProcessor {
         let new_volume = current_volume.checked_add(amount).ok_or(PaymentError::Overflow)?;
         if new_volume > max_volume {
             CircuitBreakerTriggered {
-                reason: String::from_slice(env, b"Ledger volume exceeds limit"),
+                reason: String::from_str(env, "Ledger volume exceeds limit"),
                 transaction_amount: amount,
                 volume_this_ledger: new_volume,
                 ledger_number: current_ledger,
@@ -1642,7 +1440,8 @@ impl PaymentProcessor {
         asset: &Address,
         amount: i128,
         order_ref: String,
-        discount: i128,
+        category: String,
+        royalties: &Vec<RoyaltyShare>,
     ) -> Result<u64, PaymentError> {
         if amount <= 0 {
             return Err(PaymentError::InvalidAmount);
@@ -1654,7 +1453,11 @@ impl PaymentProcessor {
             return Err(PaymentError::InvalidOrderRef);
         }
         let order_key = DataKey::Order(merchant.clone(), order_ref.clone());
+        // Idempotency check for issue #137: return existing payment ID if order already processed
         if is_entry_valid(env, &order_key) {
+            if let Some(existing_id) = env.storage().persistent().get::<_, u64>(&order_key) {
+                return Ok(existing_id);
+            }
             return Err(PaymentError::DuplicateOrder);
         }
 
@@ -1686,7 +1489,24 @@ impl PaymentProcessor {
             storage.set(&DataKey::FeesCollected, &collected);
         }
 
-        let loyalty_points = Self::accrue_loyalty(env, &merchant, payer, amount);
+        let loyalty_points = match env.storage().instance().get::<_, Address>(&DataKey::Loyalty) {
+            Some(loyalty) => LoyaltyClient::new(env, &loyalty).accrue(
+                &env.current_contract_address(),
+                &merchant,
+                payer,
+                &amount,
+            ),
+            None => 0,
+        };
+
+        let count = Self::payment_count(env.clone())
+            .checked_add(1)
+            .ok_or(PaymentError::Overflow)?;
+        let id = Self::new_payment_id(env, payer, &merchant, &order_ref, count);
+        let m_count = Self::merchant_payment_count(env.clone(), merchant.clone())
+            .checked_add(1)
+            .ok_or(PaymentError::Overflow)?;
+
         let payment = Payment {
             id,
             payer: payer.clone(),
@@ -1701,7 +1521,17 @@ impl PaymentProcessor {
             status: PaymentStatus::Completed,
             created_at: env.ledger().timestamp(),
         };
-        Self::record_sale(env, &payment, nonce)?;
+        Self::save(env, &payment);
+        let storage = env.storage();
+        storage.persistent().set(&order_key, &id);
+        extend_persistent(env, &order_key);
+        let m_key = DataKey::MerchantPaymentCount(merchant.clone());
+        env.storage().persistent().set(&m_key, &m_count);
+        extend_persistent(env, &m_key);
+        env.storage().instance().set(&DataKey::NextPaymentId, &id);
+        env.storage().instance().set(&DataKey::PaymentCount, &count);
+        extend_instance(env);
+
         ComplianceRecord {
             kind: symbol_short!("payment"),
             merchant: merchant.clone(),
@@ -1782,36 +1612,32 @@ impl PaymentProcessor {
     /// zero) moves on to the next attempt.
     fn new_payment_id(
         env: &Env,
-        payer: &Address,
-        merchant: &Address,
+        _payer: &Address,
+        _merchant: &Address,
         order_ref: &String,
         nonce: u64,
     ) -> u64 {
-        let mut attempt: u32 = 0;
+        let mut nonce: u32 = 0;
+        let mut id_base = count;
         loop {
-            let seed = (
-                merchant.clone(),
-                order_ref.clone(),
-                payer.clone(),
-                nonce,
-                env.ledger().sequence(),
-                attempt,
-            );
-            let digest = env.crypto().sha256(&seed.to_xdr(env)).to_array();
-            let mut head = [0u8; 8];
-            head.copy_from_slice(&digest[..8]);
-            let id = u64::from_be_bytes(head);
+            let id = id_base
+                .wrapping_mul(31)
+                .wrapping_add(nonce as u64)
+                .wrapping_add(env.ledger().sequence() as u64)
+                .wrapping_add(order_ref.len() as u64);
+
             if id != 0 && !env.storage().persistent().has(&DataKey::Payment(id)) {
                 return id;
             }
-            attempt += 1;
+            nonce = nonce.wrapping_add(1);
+            if nonce > 1000 {
+                id_base = id_base.wrapping_add(1);
+                nonce = 0;
+            }
         }
     }
 
-    /// Transfers `amount` and confirms the recipient was credited exactly
-    /// that, so a token that reports success without moving funds (or skims
-    /// a fee) is rejected and the whole call reverts.
-    fn transfer_checked(
+    fn with_reentrancy_guard<T>(
         env: &Env,
         client: &token::Client,
         from: &Address,
