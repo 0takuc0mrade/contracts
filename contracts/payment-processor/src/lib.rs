@@ -11,9 +11,20 @@
 //!    never holds customer funds.
 //! 4. Optionally accrues loyalty points for the payer.
 //!
-//! Marketplace integrations can settle with `pay_with_royalties`, which also
-//! pays royalty recipients a share of the net amount (after the platform fee),
-//! with the remainder going to the seller's settlement account.
+//! Other entry points settle a sale in a different shape:
+//!
+//! * `pay_with_royalties` pays royalty recipients a share of the net amount
+//!   (after the platform fee); the remainder goes to the seller.
+//! * `split_payment` records one sale paid by several buyers at once.
+//! * `pay_batch` settles several sales from one payer, all or nothing.
+//! * `pay_delegated` lets a delegatee settle for a delegator, within a
+//!   spending limit and expiry.
+//! * `pay_signed` lets a relayer submit a payment that the payer authorized
+//!   with an ed25519 signature, so the payer pays no gas.
+//!
+//! The delegated and signed flows move funds with the payer's token
+//! allowance to this contract, so the payer does not have to sign the
+//! transaction that moves the money.
 //!
 //! Critical parameters (fee rate, treasury) are changed by the admin until
 //! `enable_governance` hands them to an on-chain council: from then on they
@@ -21,7 +32,9 @@
 //! enough council members approve.
 //!
 //! Refunds are pushed by the merchant's settlement account (which received
-//! the funds) back to the original payer, up to the gross amount paid.
+//! the funds) back to the original payer, up to the gross amount paid. A
+//! refund is refused unless the settlement account holds at least the refund
+//! amount. Split payments cannot be refunded through this contract.
 //!
 //! Every transfer is checked against the recipient's balance, so a token that
 //! reports success without moving funds is rejected. Payment IDs are derived
@@ -83,6 +96,8 @@ pub trait MerchantCallbackInterface {
     );
 }
 
+/// Error codes are part of the contract's ABI: clients depend on them. New
+/// variants take new numbers, and existing numbers never change.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -135,11 +150,9 @@ pub struct Payment {
     pub fee: i128,
     pub refunded: i128,
     pub order_ref: String,
-    pub category: String,
     pub loyalty_points: u64,
     pub status: PaymentStatus,
     pub created_at: u64,
-    pub chain_id: BytesN<32>,
 }
 
 /// One line of a batch payment.
@@ -247,6 +260,7 @@ enum DataKey {
     MerchantPaymentCount(Address),
     EventIndex,
     Payment(u64),
+    SplitPayment(u64),
     Order(Address, String),
     Governance,
     ProposalCount,
@@ -276,8 +290,6 @@ pub struct PaymentSettled {
     pub amount: i128,
     pub fee: i128,
     pub order_ref: String,
-    pub category: String,
-    pub chain_id: BytesN<32>,
 }
 
 #[contractevent]
@@ -407,6 +419,15 @@ soroban_sdk::contractmeta!(key = "source_repo", val = "github:StellarPOS-App/con
 soroban_sdk::contractmeta!(key = "home_domain", val = "github.com/StellarPOS-App");
 soroban_sdk::contractmeta!(key = "desc", val = "StellarPOS payment processor");
 
+/// How the payer's tokens reach the merchant's accounts.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum Funding {
+    /// The payer authorized this invocation, so the processor transfers directly.
+    Direct,
+    /// The payer approved this contract as a spender, so it pulls the funds.
+    Allowance,
+}
+
 #[contract]
 pub struct PaymentProcessor;
 
@@ -441,9 +462,6 @@ impl PaymentProcessor {
             fee_bps,
             paused: false,
         };
-        env.storage().instance().set(&DataKey::Config, &config);
-        env.storage().instance().set(&DataKey::PaymentCount, &0u64);
-        env.storage().instance().set(&DataKey::NextPaymentId, &0u64);
         storage.set(&DataKey::Config, &config);
         storage.set(&DataKey::PaymentCount, &0u64);
         storage.set(&DataKey::CircuitBreakerMaxTx, &i128::MAX);
@@ -466,7 +484,6 @@ impl PaymentProcessor {
         asset: Address,
         amount: i128,
         order_ref: String,
-        category: String,
     ) -> Result<u64, PaymentError> {
         Self::pay_with_discount(env, payer, merchant, asset, amount, order_ref, 0)
     }
@@ -497,12 +514,12 @@ impl PaymentProcessor {
         )
     }
 
-    /// Settles a payment using delegated authorization from the actual payer.
-    /// The delegatee (caller) makes the payment on behalf of the delegator,
-    /// deducting from their spending limit. Fails if delegation is expired
-    /// or spending limit is exceeded.
+    /// Settles a payment that `delegatee` submits on behalf of `delegator`,
+    /// within the spending limit and expiry the delegator set. The delegator
+    /// must have approved this contract as a spender for the amount.
     pub fn pay_delegated(
         env: Env,
+        delegatee: Address,
         delegator: Address,
         merchant: Address,
         asset: Address,
@@ -531,14 +548,15 @@ impl PaymentProcessor {
         let delegatee = env.current_contract_address();
         let mut delegation = Self::get_delegation(&env, &delegator, &delegatee)?;
 
-        if env.ledger().timestamp() > delegation.expiry {
-            return Err(PaymentError::InvalidOrderRef);
-        }
-        if delegation.spent.checked_add(amount).ok_or(PaymentError::Overflow)?
-            > delegation.spending_limit
-        {
-            return Err(PaymentError::InvalidAmount);
-        }
+    /// Registers the ed25519 public key that `pay_signed` checks for `payer`.
+    /// The payer authorizes the registration, so only they can change it.
+    pub fn register_payment_key(env: Env, payer: Address, public_key: BytesN<32>) {
+        payer.require_auth();
+        let key = DataKey::PaymentKey(payer.clone());
+        env.storage().persistent().set(&key, &public_key);
+        extend_persistent(&env, &key);
+        PaymentKeySet { payer, public_key }.publish(&env);
+    }
 
         let settlement = Self::settlement_for(&env, &config, &merchant, &asset)?;
         let payment_id = Self::settle(
@@ -577,16 +595,12 @@ impl PaymentProcessor {
         order_ref: String,
         royalties: Vec<RoyaltyShare>,
     ) -> Result<u64, PaymentError> {
-        let config = Self::config(&env)?;
-        if config.paused {
-            return Err(PaymentError::Paused);
-        }
-        if royalties.len() > MAX_ROYALTY_RECIPIENTS {
-            return Err(PaymentError::InvalidRoyaltySplit);
-        }
-        let mut total_bps: u32 = 0;
-        for share in royalties.iter() {
-            if share.bps == 0 {
+        Self::with_reentrancy_guard(&env, || {
+            let config = Self::config(&env)?;
+            if config.paused {
+                return Err(PaymentError::Paused);
+            }
+            if royalties.len() > MAX_ROYALTY_RECIPIENTS {
                 return Err(PaymentError::InvalidRoyaltySplit);
             }
             total_bps = total_bps.saturating_add(share.bps);
@@ -671,6 +685,10 @@ impl PaymentProcessor {
             return Err(PaymentError::Paused);
         }
         Self::with_reentrancy_guard(&env, || {
+            let config = Self::config(&env)?;
+            if config.paused {
+                return Err(PaymentError::Paused);
+            }
             let mut payment = Self::load(&env, payment_id)?;
             payment.settlement.require_auth();
 
@@ -679,6 +697,9 @@ impl PaymentProcessor {
             }
             if payment.status == PaymentStatus::Refunded {
                 return Err(PaymentError::AlreadyRefunded);
+            }
+            if is_entry_valid(&env, &DataKey::SplitPayment(payment_id)) {
+                return Err(PaymentError::SplitNotRefundable);
             }
             let total = payment
                 .refunded
@@ -764,6 +785,27 @@ impl PaymentProcessor {
     pub fn set_treasury(env: Env, treasury: Address) -> Result<(), PaymentError> {
         Self::require_no_governance(&env)?;
         Self::update(&env, |c| c.treasury = treasury)
+    }
+
+    /// Sets the contract that receives loyalty accruals. Pass `None` to switch
+    /// accrual off.
+    pub fn set_loyalty(env: Env, loyalty: Option<Address>) -> Result<(), PaymentError> {
+        let config = Self::config(&env)?;
+        config.admin.require_auth();
+        match loyalty {
+            Some(addr) => env.storage().instance().set(&DataKey::Loyalty, &addr),
+            None => env.storage().instance().remove(&DataKey::Loyalty),
+        }
+        extend_instance(&env);
+        Ok(())
+    }
+
+    pub fn pause(env: Env) -> Result<(), PaymentError> {
+        Self::update(&env, |c| c.paused = true)
+    }
+
+    pub fn unpause(env: Env) -> Result<(), PaymentError> {
+        Self::update(&env, |c| c.paused = false)
     }
 
     // ---------------------------------------------------------------------
@@ -1004,7 +1046,7 @@ impl PaymentProcessor {
             return Err(PaymentError::InvalidAmount);
         }
         if expiry <= env.ledger().timestamp() {
-            return Err(PaymentError::InvalidOrderRef);
+            return Err(PaymentError::DelegationExpired);
         }
 
         let delegation = Delegation {
@@ -1426,7 +1468,7 @@ impl PaymentProcessor {
         for share in royalties.iter() {
             let cut = bps_of(net, share.bps).ok_or(PaymentError::Overflow)?;
             if cut > 0 {
-                token.transfer(payer, &share.recipient, &cut);
+                Self::transfer_checked(env, &token, payer, &share.recipient, cut, funding)?;
                 seller_net -= cut;
                 RoyaltyPaid {
                     payment_id: id,
@@ -1437,10 +1479,8 @@ impl PaymentProcessor {
             }
         }
         if seller_net > 0 {
-            token.transfer(payer, &settlement, &seller_net);
+            Self::transfer_checked(env, &token, payer, &settlement, seller_net, funding)?;
         }
-        let client = token::Client::new(env, asset);
-        Self::transfer_checked(&client, payer, &settlement, net)?;
         if fee > 0 {
             token.transfer(payer, &config.treasury, &fee);
             let storage = env.storage().instance();
@@ -1477,11 +1517,9 @@ impl PaymentProcessor {
             fee,
             refunded: 0,
             order_ref: order_ref.clone(),
-            category: category.clone(),
             loyalty_points,
             status: PaymentStatus::Completed,
             created_at: env.ledger().timestamp(),
-            chain_id: env.ledger().network_id(),
         };
         Self::save(env, &payment);
         let storage = env.storage();
@@ -1515,8 +1553,6 @@ impl PaymentProcessor {
             amount,
             fee,
             order_ref,
-            category,
-            chain_id: env.ledger().network_id(),
         }
         .publish(env);
 
@@ -1524,39 +1560,62 @@ impl PaymentProcessor {
         Ok(id)
     }
 
-    /// Transfers `amount` and confirms the recipient was credited exactly
-    /// that, so a token that reports success without moving funds (or skims
-    /// a fee) is rejected and the whole call reverts.
-    fn transfer_checked(
-        client: &token::Client,
-        from: &Address,
-        to: &Address,
-        amount: i128,
-    ) -> Result<(), PaymentError> {
-        if from == to {
-            client.transfer(from, to, &amount);
-            return Ok(());
-        }
-        let expected = client
-            .balance(to)
-            .checked_add(amount)
+    /// Saves a sale, its order key and the counters. Called once all of the
+    /// sale's transfers have succeeded.
+    fn record_sale(env: &Env, payment: &Payment, nonce: u64) -> Result<(), PaymentError> {
+        let active = Self::payment_count(env.clone())
+            .checked_add(1)
             .ok_or(PaymentError::Overflow)?;
-        client.transfer(from, to, &amount);
-        if client.balance(to) != expected {
-            return Err(PaymentError::TransferFailed);
-        }
+        let m_count = Self::merchant_payment_count(env.clone(), payment.merchant.clone())
+            .checked_add(1)
+            .ok_or(PaymentError::Overflow)?;
+
+        Self::save(env, payment);
+        let order_key = DataKey::Order(payment.merchant.clone(), payment.order_ref.clone());
+        env.storage().persistent().set(&order_key, &payment.id);
+        extend_persistent(env, &order_key);
+        let m_key = DataKey::MerchantPaymentCount(payment.merchant.clone());
+        env.storage().persistent().set(&m_key, &m_count);
+        extend_persistent(env, &m_key);
+        env.storage()
+            .instance()
+            .set(&DataKey::NextPaymentId, &nonce);
+        env.storage()
+            .instance()
+            .set(&DataKey::PaymentCount, &active);
+        extend_instance(env);
         Ok(())
     }
 
+    /// The next payment's nonce and hashed ID. The nonce is a counter that
+    /// never goes back down, so refunds cannot cause an ID to be reused.
+    fn next_payment(
+        env: &Env,
+        payer: &Address,
+        merchant: &Address,
+        order_ref: &String,
+    ) -> Result<(u64, u64), PaymentError> {
+        let last: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextPaymentId)
+            .unwrap_or(0);
+        let nonce = last.checked_add(1).ok_or(PaymentError::Overflow)?;
+        Ok((
+            nonce,
+            Self::new_payment_id(env, payer, merchant, order_ref, nonce),
+        ))
+    }
+
     /// The first 8 bytes of a SHA-256 over the payment's own data and the
-    /// running count, so the next ID cannot be read off a counter. A
-    /// collision (or zero) moves on to the next nonce.
+    /// nonce, so the next ID cannot be read off a counter. A collision (or
+    /// zero) moves on to the next attempt.
     fn new_payment_id(
         env: &Env,
         _payer: &Address,
         _merchant: &Address,
         order_ref: &String,
-        count: u64,
+        nonce: u64,
     ) -> u64 {
         let mut nonce: u32 = 0;
         let mut id_base = count;
@@ -1580,24 +1639,77 @@ impl PaymentProcessor {
 
     fn with_reentrancy_guard<T>(
         env: &Env,
-        f: impl FnOnce() -> Result<T, PaymentError>,
-    ) -> Result<T, PaymentError> {
-        if env
+        client: &token::Client,
+        from: &Address,
+        to: &Address,
+        amount: i128,
+        funding: Funding,
+    ) -> Result<(), PaymentError> {
+        let spender = env.current_contract_address();
+        let expected = if from == to {
+            None
+        } else {
+            Some(
+                client
+                    .balance(to)
+                    .checked_add(amount)
+                    .ok_or(PaymentError::Overflow)?,
+            )
+        };
+        match funding {
+            Funding::Direct => client.transfer(from, to, &amount),
+            Funding::Allowance => client.transfer_from(&spender, from, to, &amount),
+        }
+        if let Some(expected) = expected {
+            if client.balance(to) != expected {
+                return Err(PaymentError::TransferFailed);
+            }
+        }
+        Ok(())
+    }
+
+    /// Accrues loyalty points for a payment, if a loyalty program is set.
+    fn accrue_loyalty(env: &Env, merchant: &Address, payer: &Address, amount: i128) -> u64 {
+        match env
             .storage()
             .instance()
-            .get(&DataKey::ReentrancyLock)
-            .unwrap_or(false)
+            .get::<_, Address>(&DataKey::Loyalty)
         {
-            return Err(PaymentError::Reentrancy);
+            Some(loyalty) => LoyaltyClient::new(env, &loyalty).accrue(
+                &env.current_contract_address(),
+                merchant,
+                payer,
+                &amount,
+            ),
+            None => 0,
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::ReentrancyLock, &true);
-        let result = f();
-        env.storage()
-            .instance()
-            .set(&DataKey::ReentrancyLock, &false);
-        result
+    }
+
+    /// The bytes a payer signs for `pay_signed`. The leading symbol and the
+    /// contract address keep a signature from being replayed for another
+    /// function or contract.
+    #[allow(clippy::too_many_arguments)]
+    fn signed_message(
+        env: &Env,
+        payer: &Address,
+        merchant: &Address,
+        asset: &Address,
+        amount: i128,
+        order_ref: &String,
+        nonce: u64,
+        expires_at: u64,
+    ) -> Bytes {
+        let mut message = (
+            symbol_short!("payauth"),
+            env.current_contract_address(),
+            payer.clone(),
+            merchant.clone(),
+            asset.clone(),
+            amount,
+        )
+            .to_xdr(env);
+        message.append(&(order_ref.clone(), nonce, expires_at).to_xdr(env));
+        message
     }
 
     fn invoke_merchant_callback(
@@ -1619,6 +1731,31 @@ impl PaymentProcessor {
                 &amount,
             );
         }
+    }
+
+    /// Runs `f` with the reentrancy lock held. A payment that is reached from
+    /// inside another one (for example through a merchant callback) fails
+    /// with `Reentrancy` instead of settling twice.
+    fn with_reentrancy_guard<T>(
+        env: &Env,
+        f: impl FnOnce() -> Result<T, PaymentError>,
+    ) -> Result<T, PaymentError> {
+        if env
+            .storage()
+            .instance()
+            .get(&DataKey::ReentrancyLock)
+            .unwrap_or(false)
+        {
+            return Err(PaymentError::Reentrancy);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentrancyLock, &true);
+        let result = f();
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentrancyLock, &false);
+        result
     }
 
     fn config(env: &Env) -> Result<Config, PaymentError> {
@@ -1703,7 +1840,12 @@ impl PaymentProcessor {
     /// Global monotonic counter in persistent storage, so event indices are
     /// never reissued across upgrades or payment restarts.
     fn next_event_index(env: &Env) -> u64 {
-        let idx: u64 = env.storage().persistent().get(&DataKey::EventIndex).unwrap_or(0) + 1;
+        let idx: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EventIndex)
+            .unwrap_or(0)
+            + 1;
         env.storage().persistent().set(&DataKey::EventIndex, &idx);
         extend_persistent(env, &DataKey::EventIndex);
         idx
