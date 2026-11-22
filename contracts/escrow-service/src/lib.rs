@@ -36,6 +36,10 @@ use soroban_sdk::{
 pub const MAX_EVIDENCE: u32 = 10;
 pub const MIN_ARBITRATION_WINDOW: u64 = 60 * 60;
 pub const MAX_ARBITRATION_WINDOW: u64 = 30 * 24 * 60 * 60;
+/// Premium charged for an insured escrow (1% of the payment amount).
+pub const INSURANCE_PREMIUM_BPS: u32 = 100;
+/// Maximum seller reimbursement for a buyer refund (10% of the escrow amount).
+pub const INSURANCE_COVERAGE_BPS: u32 = 1_000;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -149,6 +153,8 @@ enum DataKey {
     Escrow(u64),
     Dispute(u64),
     Evidence(u64),
+    Insured(u64),
+    InsurancePool(Address),
 }
 
 #[contractevent]
@@ -323,6 +329,61 @@ impl EscrowService {
         }
         .publish(&env);
         Ok(id)
+    }
+
+    /// Opens an insured escrow. The seller opts in by authorizing this call;
+    /// the buyer pays a 1% premium into the pool for this asset.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_insured(
+        env: Env,
+        buyer: Address,
+        seller: Address,
+        arbiter: Address,
+        asset: Address,
+        amount: i128,
+        release_at: u64,
+        arbitration_window: u64,
+    ) -> Result<u64, EscrowError> {
+        seller.require_auth();
+        let premium = amount
+            .checked_mul(INSURANCE_PREMIUM_BPS as i128)
+            .ok_or(EscrowError::Overflow)?
+            / 10_000;
+        if premium <= 0 {
+            return Err(EscrowError::InvalidAmount);
+        }
+
+        let id = Self::create(
+            env.clone(),
+            buyer.clone(),
+            seller,
+            arbiter,
+            asset.clone(),
+            amount,
+            release_at,
+            arbitration_window,
+        )?;
+        token::Client::new(&env, &asset).transfer(
+            &buyer,
+            &env.current_contract_address(),
+            &premium,
+        );
+        env.storage().persistent().set(&DataKey::Insured(id), &true);
+        let pool_key = DataKey::InsurancePool(asset);
+        let pool: i128 = env.storage().persistent().get(&pool_key).unwrap_or(0);
+        let pool = pool.checked_add(premium).ok_or(EscrowError::Overflow)?;
+        env.storage().persistent().set(&pool_key, &pool);
+        extend_persistent(&env, &pool_key);
+        extend_persistent(&env, &DataKey::Insured(id));
+        Ok(id)
+    }
+
+    /// Returns the accounted insurance reserve for an asset.
+    pub fn insurance_balance(env: Env, asset: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::InsurancePool(asset))
+            .unwrap_or(0)
     }
 
     /// Buyer confirms delivery and releases everything left to the seller.
@@ -543,6 +604,27 @@ impl EscrowService {
         let remaining = escrow.remaining();
         let to_buyer = bps_of(remaining, buyer_bps).ok_or(EscrowError::InvalidSplit)?;
         let to_seller = remaining - to_buyer;
+        if to_buyer > 0
+            && env
+                .storage()
+                .persistent()
+                .get::<_, bool>(&DataKey::Insured(escrow.id))
+                .unwrap_or(false)
+        {
+            let cap = bps_of(escrow.amount, INSURANCE_COVERAGE_BPS).ok_or(EscrowError::Overflow)?;
+            let pool_key = DataKey::InsurancePool(escrow.asset.clone());
+            let pool: i128 = env.storage().persistent().get(&pool_key).unwrap_or(0);
+            let cover = to_buyer.min(cap).min(pool);
+            if cover > 0 {
+                token::Client::new(env, &escrow.asset).transfer(
+                    &env.current_contract_address(),
+                    &escrow.seller,
+                    &cover,
+                );
+                env.storage().persistent().set(&pool_key, &(pool - cover));
+                extend_persistent(env, &pool_key);
+            }
+        }
         dispute.buyer_bps = buyer_bps;
         dispute.by_default = by_default;
         Self::save_dispute(env, escrow.id, &dispute);
