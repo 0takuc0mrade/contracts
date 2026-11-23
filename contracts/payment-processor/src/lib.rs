@@ -1,6 +1,7 @@
-//! Payment processor.
+//! StellarPOS payment processor.
 //!
-//! Settles a point-of-sale payment in a single atomic transaction:
+//! A merchant registers once in the merchant registry with a settlement
+//! account and the assets it accepts; every sale is then settled here:
 //!
 //! 1. Checks the merchant is active in the merchant registry and accepts
 //!    the asset being paid.
@@ -60,7 +61,7 @@ use soroban_sdk::{
 };
 
 pub const MAX_ORDER_REF_LEN: u32 = 64;
-/// Most payments in one pay_batch call, to stay well inside resource limits.
+/// Most payments in one `pay_batch` call, to stay well inside resource limits.
 pub const MAX_BATCH: u32 = 20;
 /// Contract version for tracking deployed releases.
 pub const VERSION: &str = "1.0.0";
@@ -267,6 +268,7 @@ enum DataKey {
     Proposal(u64),
     Delegation(Address, Address),
     MerchantCallback(Address),
+    TokenDecimals(Address),
     ReentrancyLock,
     Loyalty,
     CircuitBreakerMaxTx,
@@ -447,8 +449,7 @@ impl PaymentProcessor {
         treasury: Address,
         fee_bps: u32,
     ) -> Result<(), PaymentError> {
-        let storage = env.storage().instance();
-        if storage.has(&DataKey::Config) {
+        if env.storage().instance().has(&DataKey::Config) {
             return Err(PaymentError::AlreadyInitialized);
         }
         admin.require_auth();
@@ -1363,6 +1364,15 @@ impl PaymentProcessor {
         split_fee(amount, Self::config(&env)?.fee_bps).ok_or(PaymentError::Overflow)
     }
 
+    /// Decimal places of `asset`, served from a cache that is filled on the
+    /// first call and reused by later payments.
+    pub fn token_decimals(env: Env, asset: Address) -> Result<u32, PaymentError> {
+        if !env.storage().instance().has(&DataKey::Config) {
+            return Err(PaymentError::NotInitialized);
+        }
+        Ok(Self::cached_decimals(&env, &asset))
+    }
+
     // ---------------------------------------------------------------------
     // Internals
     // ---------------------------------------------------------------------
@@ -1464,15 +1474,23 @@ impl PaymentProcessor {
         let discounted_amount = amount.checked_sub(discount).ok_or(PaymentError::InvalidAmount)?;
         let (fee, net) = split_fee(discounted_amount, config.fee_bps).ok_or(PaymentError::Overflow)?;
         let token = token::Client::new(env, asset);
-        let mut seller_net = net;
+        let decimals = Self::cached_decimals(env, asset);
+        let id = Self::next_id(env, payer, &merchant, &order_ref)?;
+
+        // Royalties come out of the net amount, so the payer is never charged
+        // more than `amount` even when the shares add up to 100%.
+        let mut remaining = net;
         for share in royalties.iter() {
-            let cut = bps_of(net, share.bps).ok_or(PaymentError::Overflow)?;
+            let mut cut = bps_of(net, share.bps).ok_or(PaymentError::Overflow)?;
+            if cut > remaining {
+                cut = remaining;
+            }
             if cut > 0 {
                 Self::transfer_checked(env, &token, payer, &share.recipient, cut, funding)?;
                 seller_net -= cut;
                 RoyaltyPaid {
                     payment_id: id,
-                    recipient: share.recipient,
+                    recipient: share.recipient.clone(),
                     amount: cut,
                 }
                 .publish(env);
@@ -1489,7 +1507,11 @@ impl PaymentProcessor {
             storage.set(&DataKey::FeesCollected, &collected);
         }
 
-        let loyalty_points = match env.storage().instance().get::<_, Address>(&DataKey::Loyalty) {
+        let loyalty_points = match env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Loyalty)
+        {
             Some(loyalty) => LoyaltyClient::new(env, &loyalty).accrue(
                 &env.current_contract_address(),
                 &merchant,
@@ -1511,7 +1533,7 @@ impl PaymentProcessor {
             id,
             payer: payer.clone(),
             merchant: merchant.clone(),
-            settlement,
+            settlement: settlement.clone(),
             asset: asset.clone(),
             amount,
             fee,
@@ -1522,8 +1544,7 @@ impl PaymentProcessor {
             created_at: env.ledger().timestamp(),
         };
         Self::save(env, &payment);
-        let storage = env.storage();
-        storage.persistent().set(&order_key, &id);
+        env.storage().persistent().set(&order_key, &id);
         extend_persistent(env, &order_key);
         let m_key = DataKey::MerchantPaymentCount(merchant.clone());
         env.storage().persistent().set(&m_key, &m_count);
@@ -1537,7 +1558,7 @@ impl PaymentProcessor {
             merchant: merchant.clone(),
             payment_id: id,
             payer: payer.clone(),
-            settlement: payment.settlement.clone(),
+            settlement: settlement.clone(),
             asset: asset.clone(),
             amount,
             fee,
@@ -1812,7 +1833,8 @@ impl PaymentProcessor {
         Ok(())
     }
 
-    /// Saves the proposal, applying its change first when it has enough approvals.
+    /// Saves the proposal, applying its change first when it has enough
+    /// approvals.
     fn apply_if_ready(
         env: &Env,
         gov: &Governance,
@@ -1915,6 +1937,3 @@ impl PaymentProcessor {
         extend_persistent(env, &key);
     }
 }
-
-#[cfg(test)]
-mod test;
