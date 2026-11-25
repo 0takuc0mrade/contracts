@@ -30,7 +30,10 @@
 
 #![no_std]
 
-use shared::{bps_of, extend_instance, extend_persistent, is_entry_valid, split_fee, BPS_DENOMINATOR, MAX_FEE_BPS};
+use shared::{
+    bps_of, extend_instance, extend_persistent, is_entry_valid, split_fee, BPS_DENOMINATOR,
+    MAX_FEE_BPS,
+};
 use soroban_sdk::{
     contract, contractclient, contracterror, contractevent, contractimpl, contracttype,
     symbol_short, token, Address, BytesN, Env, IntoVal, Map, String, Symbol, Vec,
@@ -45,9 +48,8 @@ pub const MAX_ROYALTY_RECIPIENTS: u32 = 5;
 pub const MAX_COUNCIL: u32 = 10;
 /// Most contributing buyers in one split_payment call.
 pub const MAX_SPLITS: u32 = 20;
-/// Fee-recipient changes are deliberately delayed to give governance/users time
-/// to react to a malicious redirect (#105).
-pub const TREASURY_CHANGE_DELAY: u64 = 7 * 24 * 60 * 60;
+pub const DEFAULT_MAX_PAYMENTS_PER_BLOCK: u32 = 20;
+pub const MAX_MAX_PAYMENTS_PER_BLOCK: u32 = 100;
 
 /// The subset of the merchant registry this contract calls.
 #[allow(dead_code)]
@@ -112,9 +114,10 @@ pub enum PaymentError {
     ProposalExecuted = 19,
     AlreadyApproved = 20,
     /// The token did not credit the recipient with the amount transferred.
-    TransferFailed = 14,
-    InvalidSplit = 15,
-    Reentrancy = 16,
+    TransferFailed = 21,
+    InvalidSplit = 22,
+    Reentrancy = 23,
+    InvalidRateLimit = 24,
 }
 
 #[contracttype]
@@ -218,6 +221,23 @@ pub struct Config {
     pub treasury: Address,
     pub fee_bps: u32,
     pub paused: bool,
+    pub max_payments_per_block: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantAnalytics {
+    pub total_volume: i128,
+    pub payment_count: u64,
+    /// Basis points; remains zero until dispute records are supported.
+    pub dispute_rate: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PaymentRateWindow {
+    ledger: u32,
+    count: u32,
 }
 
 #[contracttype]
@@ -240,6 +260,8 @@ enum DataKey {
     PaymentCount,
     NextPaymentId,
     MerchantPaymentCount(Address),
+    MerchantAnalytics(Address),
+    PaymentRate(Address),
     EventIndex,
     Payment(u64),
     Order(Address, String),
@@ -445,6 +467,7 @@ impl PaymentProcessor {
             treasury,
             fee_bps,
             paused: false,
+            max_payments_per_block: DEFAULT_MAX_PAYMENTS_PER_BLOCK,
         };
         env.storage().instance().set(&DataKey::Config, &config);
         let roles = AdminRoles {
@@ -494,19 +517,19 @@ impl PaymentProcessor {
         if config.paused {
             return Err(PaymentError::Paused);
         }
-        payer.require_auth_for_args(
-            (
-                merchant.clone(),
-                asset.clone(),
-                amount,
-                order_ref.clone(),
-                category.clone(),
-            )
-                .into_val(&env),
-        );
+        payer.require_auth();
+        Self::consume_rate_limit(&env, &config, &payer)?;
         let settlement = Self::settlement_for(&env, &config, &merchant, &asset)?;
         Self::settle(
-            &env, &config, &payer, merchant, settlement, &asset, amount, order_ref, category,
+            &env,
+            &config,
+            &payer,
+            merchant,
+            settlement,
+            &asset,
+            amount,
+            order_ref,
+            category,
             &Vec::new(&env),
         )
     }
@@ -528,6 +551,11 @@ impl PaymentProcessor {
         if config.paused {
             return Err(PaymentError::Paused);
         }
+        if amount <= 0 {
+            return Err(PaymentError::InvalidAmount);
+        }
+        delegator.require_auth();
+        Self::consume_rate_limit(&env, &config, &delegator)?;
         let delegatee = env.current_contract_address();
         let mut delegation = Self::get_delegation(&env, &delegator, &delegatee)?;
 
@@ -583,18 +611,10 @@ impl PaymentProcessor {
         if total_bps > BPS_DENOMINATOR {
             return Err(PaymentError::InvalidRoyaltySplit);
         }
-        payer.require_auth_for_args(
-            (
-                merchant.clone(),
-                asset.clone(),
-                amount,
-                order_ref.clone(),
-                royalties.clone(),
-            )
-                .into_val(&env),
-        );
+        payer.require_auth();
+        Self::consume_rate_limit(&env, &config, &payer)?;
         let settlement = Self::settlement_for(&env, &config, &merchant, &asset)?;
-        let payment_id = Self::settle(
+        Self::settle(
             &env,
             &config,
             &payer,
@@ -627,6 +647,10 @@ impl PaymentProcessor {
             let mut targets: Map<Address, Address> = Map::new(&env);
             let mut ids = Vec::new(&env);
             for line in lines.iter() {
+                if line.amount <= 0 {
+                    return Err(PaymentError::InvalidAmount);
+                }
+                Self::consume_rate_limit(&env, &config, &payer)?;
                 let settlement = match targets.get(line.merchant.clone()) {
                     Some(value) => value,
                     None => {
@@ -836,6 +860,14 @@ impl PaymentProcessor {
 
     pub fn get_price_oracle(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::PriceOracle)
+    }
+
+    /// Sets the maximum number of payments one payer may create per ledger.
+    pub fn set_max_payments_per_block(env: Env, limit: u32) -> Result<(), PaymentError> {
+        if limit == 0 || limit > MAX_MAX_PAYMENTS_PER_BLOCK {
+            return Err(PaymentError::InvalidRateLimit);
+        }
+        Self::update(&env, |c| c.max_payments_per_block = limit)
     }
 
     // ---------------------------------------------------------------------
@@ -1076,6 +1108,27 @@ impl PaymentProcessor {
             .unwrap_or(0)
     }
 
+    /// Returns aggregate payment data for a merchant. `dispute_rate` is zero
+    /// until dispute records are part of this processor's state model.
+    pub fn merchant_analytics(env: Env, merchant: Address) -> MerchantAnalytics {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantAnalytics(merchant))
+            .unwrap_or(MerchantAnalytics {
+                total_volume: 0,
+                payment_count: 0,
+                dispute_rate: 0,
+            })
+    }
+
+    pub fn merchant_total_volume(env: Env, merchant: Address) -> i128 {
+        Self::merchant_analytics(env, merchant).total_volume
+    }
+
+    pub fn merchant_dispute_rate(env: Env, merchant: Address) -> u32 {
+        Self::merchant_analytics(env, merchant).dispute_rate
+    }
+
     pub fn get_config(env: Env) -> Result<Config, PaymentError> {
         Self::config(&env)
     }
@@ -1123,6 +1176,26 @@ impl PaymentProcessor {
             .ok_or(PaymentError::MerchantNotAccepting)
     }
 
+    fn consume_rate_limit(env: &Env, config: &Config, payer: &Address) -> Result<(), PaymentError> {
+        let key = DataKey::PaymentRate(payer.clone());
+        let ledger = env.ledger().sequence();
+        let mut window = env
+            .storage()
+            .persistent()
+            .get::<_, PaymentRateWindow>(&key)
+            .unwrap_or(PaymentRateWindow { ledger, count: 0 });
+        if window.ledger != ledger {
+            window = PaymentRateWindow { ledger, count: 0 };
+        }
+        if window.count >= config.max_payments_per_block {
+            return Err(PaymentError::InvalidRateLimit);
+        }
+        window.count = window.count.checked_add(1).ok_or(PaymentError::Overflow)?;
+        env.storage().persistent().set(&key, &window);
+        extend_persistent(env, &key);
+        Ok(())
+    }
+
     /// Validates, transfers and records one payment. The caller has checked
     /// the pause flag and the payer's authorization.
     #[allow(clippy::too_many_arguments)]
@@ -1156,8 +1229,14 @@ impl PaymentProcessor {
             let cut = bps_of(net, share.bps).ok_or(PaymentError::Overflow)?;
             seller_net = seller_net.checked_sub(cut).ok_or(PaymentError::Overflow)?;
             if cut > 0 {
-                Self::transfer_checked(&client, payer, &share.recipient, cut)?;
-                RoyaltyPaid { payment_id: id, recipient: share.recipient, amount: cut }.publish(env);
+                Self::transfer_checked(&token, payer, &share.recipient, cut)?;
+                seller_net -= cut;
+                RoyaltyPaid {
+                    payment_id: id,
+                    recipient: share.recipient,
+                    amount: cut,
+                }
+                .publish(env);
             }
         }
         let client = token::Client::new(env, asset);
@@ -1193,6 +1272,26 @@ impl PaymentProcessor {
         let m_key = DataKey::MerchantPaymentCount(merchant.clone());
         env.storage().persistent().set(&m_key, &merchant_count);
         extend_persistent(env, &m_key);
+        let analytics_key = DataKey::MerchantAnalytics(merchant.clone());
+        let mut analytics = env
+            .storage()
+            .persistent()
+            .get::<_, MerchantAnalytics>(&analytics_key)
+            .unwrap_or(MerchantAnalytics {
+                total_volume: 0,
+                payment_count: 0,
+                dispute_rate: 0,
+            });
+        analytics.total_volume = analytics
+            .total_volume
+            .checked_add(amount)
+            .ok_or(PaymentError::Overflow)?;
+        analytics.payment_count = analytics
+            .payment_count
+            .checked_add(1)
+            .ok_or(PaymentError::Overflow)?;
+        env.storage().persistent().set(&analytics_key, &analytics);
+        extend_persistent(env, &analytics_key);
         env.storage().instance().set(&DataKey::NextPaymentId, &id);
         env.storage().instance().set(&DataKey::PaymentCount, &count);
         extend_instance(env);
@@ -1410,8 +1509,13 @@ impl PaymentProcessor {
         if proposal.approvals.len() >= gov.threshold {
             let config = Self::config(env)?;
             match proposal.change.clone() {
-                ParamChange::FeeBps(bps) => Self::store_config(env, config, |c| c.fee_bps = bps)?,
-                ParamChange::Treasury(t) => { Self::schedule_treasury_change(env, t)?; },
+                ParamChange::FeeBps(bps) => {
+                    if bps > MAX_FEE_BPS {
+                        return Err(PaymentError::InvalidFeeRate);
+                    }
+                    Self::store_config(env, config, |c| c.fee_bps = bps)?
+                }
+                ParamChange::Treasury(t) => Self::store_config(env, config, |c| c.treasury = t)?,
             }
             proposal.executed = true;
             ParamChangeApplied { proposal_id: proposal.id, change: proposal.change.clone() }.publish(env);
