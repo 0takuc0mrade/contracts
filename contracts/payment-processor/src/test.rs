@@ -534,3 +534,17 @@ fn admin_roles_default_to_legacy_admin_and_can_be_separated() {
     assert_eq!(roles.dispute_admin, dispute_admin);
     assert_eq!(roles.upgrade_admin, upgrade_admin);
 }
+
+
+#[test]
+fn registered_merchant_payment_count_reads_zero_without_allocating_storage() {
+    let s = setup(250);
+    let key = DataKey::MerchantPaymentCount(s.merchant.clone());
+    assert!(!s.env.as_contract(&s.pp.address, || {
+        s.env.storage().persistent().has(&key)
+    }));
+    assert_eq!(s.pp.merchant_payment_count(&s.merchant), 0);
+    assert!(!s.env.as_contract(&s.pp.address, || {
+        s.env.storage().persistent().has(&key)
+    }));
+}

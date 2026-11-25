@@ -2,7 +2,7 @@
 
 use escrow_service::{
     dispute::DisputeReason, EscrowError, EscrowService, EscrowServiceClient, EscrowStatus,
-    CURRENT_SCHEMA_VERSION, LEDGER_CLOSE_SECONDS, MAX_EVIDENCE, SETTLEMENT_GRACE_PERIOD,
+    CURRENT_SCHEMA_VERSION, LEDGER_CLOSE_SECONDS, MAX_EVIDENCE, MIN_ESCROW_LOCK_PERIOD, SETTLEMENT_GRACE_PERIOD,
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -102,6 +102,7 @@ fn arbiter_splits_funds() {
     w.escrow.submit_evidence(&w.seller, &w.id, &hash(&w.env, 2));
 
     // 30% back to the buyer, 70% to the seller.
+    advance(&w, MIN_ESCROW_LOCK_PERIOD);
     w.escrow.resolve(&w.id, &3_000);
     assert_eq!(w.token.balance(&w.buyer), 300);
     assert_eq!(w.token.balance(&w.seller), 700);
