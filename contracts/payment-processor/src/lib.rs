@@ -30,8 +30,7 @@
 
 #![no_std]
 
-use shared::{bps_of, extend_instance, extend_persistent, split_fee, BPS_DENOMINATOR, MAX_FEE_BPS};
-use shared::{extend_instance, extend_persistent, is_entry_valid, split_fee, MAX_FEE_BPS};
+use shared::{bps_of, extend_instance, extend_persistent, is_entry_valid, split_fee, BPS_DENOMINATOR, MAX_FEE_BPS};
 use soroban_sdk::{
     contract, contractclient, contracterror, contractevent, contractimpl, contracttype,
     symbol_short, token, Address, BytesN, Env, IntoVal, Map, String, Symbol, Vec,
@@ -46,6 +45,9 @@ pub const MAX_ROYALTY_RECIPIENTS: u32 = 5;
 pub const MAX_COUNCIL: u32 = 10;
 /// Most contributing buyers in one split_payment call.
 pub const MAX_SPLITS: u32 = 20;
+/// Fee-recipient changes are deliberately delayed to give governance/users time
+/// to react to a malicious redirect (#105).
+pub const TREASURY_CHANGE_DELAY: u64 = 7 * 24 * 60 * 60;
 
 /// The subset of the merchant registry this contract calls.
 #[allow(dead_code)]
@@ -60,6 +62,15 @@ pub trait RegistryInterface {
 pub trait LoyaltyInterface {
     fn accrue(env: Env, caller: Address, merchant: Address, customer: Address, amount: i128)
         -> u64;
+}
+
+/// Price-normalization oracle used to calculate fees in a common denomination.
+/// The returned fee is converted back into the payment asset before transfer.
+#[allow(dead_code)]
+#[contractclient(name = "PriceOracleClient")]
+pub trait PriceOracleInterface {
+    fn normalize(env: Env, asset: Address, amount: i128) -> i128;
+    fn denormalize(env: Env, asset: Address, normalized_amount: i128) -> i128;
 }
 
 /// Optional merchant callback invoked after a payment settles.
@@ -186,6 +197,21 @@ pub struct SplitShare {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingTreasuryChange {
+    pub treasury: Address,
+    pub execute_after: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminRoles {
+    pub fee_admin: Address,
+    pub dispute_admin: Address,
+    pub upgrade_admin: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
     pub admin: Address,
     pub registry: Address,
@@ -208,6 +234,9 @@ pub struct Delegation {
 #[derive(Clone)]
 enum DataKey {
     Config,
+    AdminRoles,
+    PendingTreasuryChange,
+    PriceOracle,
     PaymentCount,
     NextPaymentId,
     MerchantPaymentCount(Address),
@@ -219,7 +248,7 @@ enum DataKey {
     Proposal(u64),
     Loyalty,
     Delegation(Address, Address),
-
+    Loyalty,
     MerchantCallback(Address),
     ReentrancyLock,
 }
@@ -317,6 +346,39 @@ pub struct ParamChangeApplied {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminRolesUpdated {
+    pub fee_admin: Address,
+    pub dispute_admin: Address,
+    pub upgrade_admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessorUpgraded {
+    pub upgrade_admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryChangeScheduled {
+    pub treasury: Address,
+    pub execute_after: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryChangeExecuted {
+    pub treasury: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PriceOracleUpdated {
+    pub oracle: Option<Address>,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConfigUpdated {
     pub fee_bps: u32,
     pub treasury: Address,
@@ -385,10 +447,14 @@ impl PaymentProcessor {
             paused: false,
         };
         env.storage().instance().set(&DataKey::Config, &config);
+        let roles = AdminRoles {
+            fee_admin: config.admin.clone(),
+            dispute_admin: config.admin.clone(),
+            upgrade_admin: config.admin.clone(),
+        };
+        env.storage().instance().set(&DataKey::AdminRoles, &roles);
         env.storage().instance().set(&DataKey::PaymentCount, &0u64);
         env.storage().instance().set(&DataKey::NextPaymentId, &0u64);
-        storage.set(&DataKey::Config, &config);
-        storage.set(&DataKey::PaymentCount, &0u64);
         extend_instance(&env);
         Ok(())
     }
@@ -396,6 +462,26 @@ impl PaymentProcessor {
     /// Settles a sale. `order_ref` is the POS order number; it must be unique
     /// per merchant.
     pub fn pay(
+        env: Env,
+        payer: Address,
+        merchant: Address,
+        asset: Address,
+        amount: i128,
+        order_ref: String,
+    ) -> Result<u64, PaymentError> {
+        let category = String::from_str(&env, "payment");
+        Self::pay_with_category(
+            env,
+            payer,
+            merchant,
+            asset,
+            amount,
+            order_ref,
+            category,
+        )
+    }
+
+    pub fn pay_with_category(
         env: Env,
         payer: Address,
         merchant: Address,
@@ -421,6 +507,7 @@ impl PaymentProcessor {
         let settlement = Self::settlement_for(&env, &config, &merchant, &asset)?;
         Self::settle(
             &env, &config, &payer, merchant, settlement, &asset, amount, order_ref, category,
+            &Vec::new(&env),
         )
     }
 
@@ -431,6 +518,7 @@ impl PaymentProcessor {
     pub fn pay_delegated(
         env: Env,
         delegator: Address,
+        delegatee: Address,
         merchant: Address,
         asset: Address,
         amount: i128,
@@ -476,31 +564,19 @@ impl PaymentProcessor {
         Ok(payment_id)
     }
 
-    /// Settles a marketplace sale with a multi-party split: the platform fee
-    /// goes to the treasury, each royalty recipient gets its `bps` share of
-    /// the net amount, and the seller's settlement account gets the rest.
-    /// Shares must be non-zero and add up to at most 100%. Like the platform
-    /// fee, royalties are not clawed back on refunds.
+    /// Settles a marketplace sale with optional royalty recipients.
     pub fn pay_with_royalties(
-        env: Env,
-        payer: Address,
-        merchant: Address,
-        asset: Address,
-        amount: i128,
-        order_ref: String,
-        royalties: Vec<RoyaltyShare>,
+        env: Env, payer: Address, merchant: Address, asset: Address, amount: i128,
+        order_ref: String, royalties: Vec<RoyaltyShare>,
     ) -> Result<u64, PaymentError> {
-        let config = Self::config(&env)?;
-        if config.paused {
-            return Err(PaymentError::Paused);
-        }
-        if royalties.len() > MAX_ROYALTY_RECIPIENTS {
-            return Err(PaymentError::InvalidRoyaltySplit);
-        }
-        let mut total_bps: u32 = 0;
-        for share in royalties.iter() {
-            if share.bps == 0 {
-                return Err(PaymentError::InvalidRoyaltySplit);
+        Self::with_reentrancy_guard(&env, || {
+            let config = Self::config(&env)?;
+            if config.paused { return Err(PaymentError::Paused); }
+            if royalties.len() > MAX_ROYALTY_RECIPIENTS { return Err(PaymentError::InvalidRoyaltySplit); }
+            let mut total_bps: u32 = 0;
+            for share in royalties.iter() {
+                if share.bps == 0 { return Err(PaymentError::InvalidRoyaltySplit); }
+                total_bps = total_bps.checked_add(share.bps).ok_or(PaymentError::Overflow)?;
             }
             total_bps = total_bps.saturating_add(share.bps);
         }
@@ -533,16 +609,9 @@ impl PaymentProcessor {
         Ok(payment_id)
     }
 
-    /// Settles several payments from one payer in a single transaction: a
-    /// customer clearing a tab of open orders, or a business paying a batch
-    /// of invoices, possibly across merchants. All lines settle or none do;
-    /// any invalid line (bad amount, duplicate order, merchant not
-    /// accepting) reverts the whole batch. Returns the payment IDs in order.
+    /// Settles several payments atomically.
     pub fn pay_batch(
-        env: Env,
-        payer: Address,
-        asset: Address,
-        lines: Vec<BatchLine>,
+        env: Env, payer: Address, asset: Address, lines: Vec<BatchLine>,
     ) -> Result<Vec<u64>, PaymentError> {
         Self::with_reentrancy_guard(&env, || {
             let config = Self::config(&env)?;
@@ -559,11 +628,11 @@ impl PaymentProcessor {
             let mut ids = Vec::new(&env);
             for line in lines.iter() {
                 let settlement = match targets.get(line.merchant.clone()) {
-                    Some(s) => s,
+                    Some(value) => value,
                     None => {
-                        let s = Self::settlement_for(&env, &config, &line.merchant, &asset)?;
-                        targets.set(line.merchant.clone(), s.clone());
-                        s
+                        let value = Self::settlement_for(&env, &config, &line.merchant, &asset)?;
+                        targets.set(line.merchant.clone(), value.clone());
+                        value
                     }
                 };
                 ids.push_back(Self::settle(
@@ -583,14 +652,9 @@ impl PaymentProcessor {
         })
     }
 
-    /// Refunds part or all of a payment from the merchant's settlement
-    /// account back to the payer. The protocol fee is not returned by the
-    /// treasury, so the merchant absorbs it on refunds.
+    /// Refunds part or all of a payment from the merchant settlement account.
     pub fn refund(
-        env: Env,
-        payment_id: u64,
-        amount: i128,
-        reason: String,
+        env: Env, payment_id: u64, amount: i128, reason: String,
     ) -> Result<i128, PaymentError> {
         Self::with_reentrancy_guard(&env, || {
             let config = Self::config(&env)?;
@@ -618,11 +682,7 @@ impl PaymentProcessor {
             Self::transfer_checked(&client, &payment.settlement, &payment.payer, amount)?;
 
             payment.refunded = total;
-            payment.status = if total == payment.amount {
-                PaymentStatus::Refunded
-            } else {
-                PaymentStatus::PartiallyRefunded
-            };
+            payment.status = if total == payment.amount { PaymentStatus::Refunded } else { PaymentStatus::PartiallyRefunded };
             Self::save(&env, &payment);
             if payment.status == PaymentStatus::Refunded {
                 let active = Self::payment_count(env.clone()).saturating_sub(1);
@@ -657,7 +717,15 @@ impl PaymentProcessor {
                 reason,
                 event_index: Self::next_event_index(&env),
             }
-            .publish(&env);
+            ComplianceRecord {
+                kind: symbol_short!("refund"), merchant: payment.merchant.clone(), payment_id,
+                payer: payment.payer.clone(), settlement: payment.settlement.clone(), asset: payment.asset.clone(),
+                amount, fee: 0, order_ref: payment.order_ref.clone(), timestamp: env.ledger().timestamp(),
+            }.publish(&env);
+            PaymentRefunded {
+                merchant: payment.merchant, payment_id, amount, total_refunded: total, reason,
+                event_index: Self::next_event_index(&env),
+            }.publish(&env);
             Ok(total)
         })
     }
@@ -681,13 +749,93 @@ impl PaymentProcessor {
         if fee_bps > MAX_FEE_BPS {
             return Err(PaymentError::InvalidFeeRate);
         }
-        Self::update(&env, |c| c.fee_bps = fee_bps)
+        let roles = Self::admin_roles(&env)?;
+        roles.fee_admin.require_auth();
+        let config = Self::config(&env)?;
+        Self::store_config(&env, config, |c| c.fee_bps = fee_bps)
     }
 
     /// Admin-only until governance is enabled; then use `propose_param_change`.
     pub fn set_treasury(env: Env, treasury: Address) -> Result<(), PaymentError> {
         Self::require_no_governance(&env)?;
-        Self::update(&env, |c| c.treasury = treasury)
+        let roles = Self::admin_roles(&env)?;
+        roles.fee_admin.require_auth();
+        Self::schedule_treasury_change(&env, treasury)
+    }
+
+    pub fn get_admin_roles(env: Env) -> Result<AdminRoles, PaymentError> {
+        Self::admin_roles(&env)
+    }
+
+    pub fn set_admin_roles(
+        env: Env,
+        fee_admin: Address,
+        dispute_admin: Address,
+        upgrade_admin: Address,
+    ) -> Result<(), PaymentError> {
+        let config = Self::config(&env)?;
+        config.admin.require_auth();
+        let roles = AdminRoles {
+            fee_admin: fee_admin.clone(),
+            dispute_admin: dispute_admin.clone(),
+            upgrade_admin: upgrade_admin.clone(),
+        };
+        env.storage().instance().set(&DataKey::AdminRoles, &roles);
+        extend_instance(&env);
+        AdminRolesUpdated { fee_admin, dispute_admin, upgrade_admin }.publish(&env);
+        Ok(())
+    }
+
+    pub fn upgrade(env: Env, wasm_hash: BytesN<32>) -> Result<(), PaymentError> {
+        let roles = Self::admin_roles(&env)?;
+        roles.upgrade_admin.require_auth();
+        let actor = roles.upgrade_admin.clone();
+        env.deployer().update_current_contract_wasm(wasm_hash);
+        ProcessorUpgraded { upgrade_admin: actor }.publish(&env);
+        Ok(())
+    }
+
+    /// Executes a previously approved treasury redirect after the seven-day
+    /// safety delay. Permissionless execution prevents an admin from holding
+    /// an approved change hostage while preserving the full timelock.
+    pub fn execute_treasury_change(env: Env) -> Result<(), PaymentError> {
+        let pending: PendingTreasuryChange = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingTreasuryChange)
+            .ok_or(PaymentError::NoPendingTreasuryChange)?;
+        if env.ledger().timestamp() < pending.execute_after {
+            return Err(PaymentError::TreasuryChangeNotReady);
+        }
+        let config = Self::config(&env)?;
+        let treasury = pending.treasury.clone();
+        Self::store_config(&env, config, |c| c.treasury = treasury.clone())?;
+        env.storage().instance().remove(&DataKey::PendingTreasuryChange);
+        extend_instance(&env);
+        TreasuryChangeExecuted { treasury }.publish(&env);
+        Ok(())
+    }
+
+    pub fn get_pending_treasury_change(env: Env) -> Option<PendingTreasuryChange> {
+        env.storage().instance().get(&DataKey::PendingTreasuryChange)
+    }
+
+    /// Configures the oracle that normalizes payment values before fee math.
+    /// `None` keeps the legacy same-denomination calculation.
+    pub fn set_price_oracle(env: Env, oracle: Option<Address>) -> Result<(), PaymentError> {
+        let config = Self::config(&env)?;
+        config.admin.require_auth();
+        match oracle.clone() {
+            Some(address) => env.storage().instance().set(&DataKey::PriceOracle, &address),
+            None => env.storage().instance().remove(&DataKey::PriceOracle),
+        }
+        extend_instance(&env);
+        PriceOracleUpdated { oracle }.publish(&env);
+        Ok(())
+    }
+
+    pub fn get_price_oracle(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PriceOracle)
     }
 
     // ---------------------------------------------------------------------
@@ -809,11 +957,17 @@ impl PaymentProcessor {
     }
 
     pub fn pause(env: Env) -> Result<(), PaymentError> {
-        Self::update(&env, |c| c.paused = true)
+        let roles = Self::admin_roles(&env)?;
+        roles.dispute_admin.require_auth();
+        let config = Self::config(&env)?;
+        Self::store_config(&env, config, |c| c.paused = true)
     }
 
     pub fn unpause(env: Env) -> Result<(), PaymentError> {
-        Self::update(&env, |c| c.paused = false)
+        let roles = Self::admin_roles(&env)?;
+        roles.dispute_admin.require_auth();
+        let config = Self::config(&env)?;
+        Self::store_config(&env, config, |c| c.paused = false)
     }
 
     // ---------------------------------------------------------------------
@@ -938,6 +1092,20 @@ impl PaymentProcessor {
         split_fee(amount, Self::config(&env)?.fee_bps).ok_or(PaymentError::Overflow)
     }
 
+    /// Asset-aware fee quote. When an oracle is configured the amount is
+    /// normalized into the common denomination before fee calculation (#107).
+    pub fn quote_in_asset(
+        env: Env,
+        asset: Address,
+        amount: i128,
+    ) -> Result<(i128, i128), PaymentError> {
+        if amount <= 0 {
+            return Err(PaymentError::InvalidAmount);
+        }
+        let config = Self::config(&env)?;
+        Self::fee_split_for_asset(&env, &config, &asset, amount)
+    }
+
     // ---------------------------------------------------------------------
     // Internals
     // ---------------------------------------------------------------------
@@ -970,12 +1138,8 @@ impl PaymentProcessor {
         category: String,
         royalties: &Vec<RoyaltyShare>,
     ) -> Result<u64, PaymentError> {
-        if amount <= 0 {
-            return Err(PaymentError::InvalidAmount);
-        }
-        if order_ref.is_empty() || order_ref.len() > MAX_ORDER_REF_LEN {
-            return Err(PaymentError::InvalidOrderRef);
-        }
+        if amount <= 0 { return Err(PaymentError::InvalidAmount); }
+        if order_ref.is_empty() || order_ref.len() > MAX_ORDER_REF_LEN { return Err(PaymentError::InvalidOrderRef); }
         let order_key = DataKey::Order(merchant.clone(), order_ref.clone());
         if is_entry_valid(env, &order_key) {
             return Err(PaymentError::DuplicateOrder);
@@ -990,15 +1154,10 @@ impl PaymentProcessor {
         let mut seller_net = net;
         for share in royalties.iter() {
             let cut = bps_of(net, share.bps).ok_or(PaymentError::Overflow)?;
+            seller_net = seller_net.checked_sub(cut).ok_or(PaymentError::Overflow)?;
             if cut > 0 {
-                token.transfer(payer, &share.recipient, &cut);
-                seller_net -= cut;
-                RoyaltyPaid {
-                    payment_id: id,
-                    recipient: share.recipient,
-                    amount: cut,
-                }
-                .publish(env);
+                Self::transfer_checked(&client, payer, &share.recipient, cut)?;
+                RoyaltyPaid { payment_id: id, recipient: share.recipient, amount: cut }.publish(env);
             }
         }
         let client = token::Client::new(env, asset);
@@ -1015,10 +1174,7 @@ impl PaymentProcessor {
             .get::<_, Address>(&DataKey::Loyalty)
         {
             Some(loyalty) => LoyaltyClient::new(env, &loyalty).accrue(
-                &env.current_contract_address(),
-                &merchant,
-                payer,
-                &amount,
+                &env.current_contract_address(), &merchant, payer, &amount,
             ),
             None => 0,
         };
@@ -1027,58 +1183,28 @@ impl PaymentProcessor {
             .checked_add(1)
             .ok_or(PaymentError::Overflow)?;
         let payment = Payment {
-            id,
-            payer: payer.clone(),
-            merchant: merchant.clone(),
-            settlement,
-            asset: asset.clone(),
-            amount,
-            fee,
-            refunded: 0,
-            order_ref: order_ref.clone(),
-            category: category.clone(),
-            loyalty_points,
-            status: PaymentStatus::Completed,
-            created_at: env.ledger().timestamp(),
-            chain_id: env.ledger().network_id(),
+            id, payer: payer.clone(), merchant: merchant.clone(), settlement, asset: asset.clone(), amount, fee,
+            refunded: 0, order_ref: order_ref.clone(), category: category.clone(), loyalty_points,
+            status: PaymentStatus::Completed, created_at: env.ledger().timestamp(), chain_id: env.ledger().network_id(),
         };
         Self::save(env, &payment);
-        let storage = env.storage();
-        storage.persistent().set(&order_key, &id);
+        env.storage().persistent().set(&order_key, &id);
         extend_persistent(env, &order_key);
         let m_key = DataKey::MerchantPaymentCount(merchant.clone());
-        env.storage().persistent().set(&m_key, &m_count);
+        env.storage().persistent().set(&m_key, &merchant_count);
         extend_persistent(env, &m_key);
         env.storage().instance().set(&DataKey::NextPaymentId, &id);
         env.storage().instance().set(&DataKey::PaymentCount, &count);
         extend_instance(env);
-
         ComplianceRecord {
-            kind: symbol_short!("payment"),
-            merchant: merchant.clone(),
-            payment_id: id,
-            payer: payer.clone(),
-            settlement: payment.settlement.clone(),
-            asset: asset.clone(),
-            amount,
-            fee,
-            order_ref: order_ref.clone(),
+            kind: symbol_short!("payment"), merchant: merchant.clone(), payment_id: id, payer: payer.clone(),
+            settlement: payment.settlement.clone(), asset: asset.clone(), amount, fee, order_ref: order_ref.clone(),
             timestamp: payment.created_at,
-        }
-        .publish(env);
+        }.publish(env);
         PaymentSettled {
-            merchant: merchant.clone(),
-            payment_id: id,
-            payer: payer.clone(),
-            asset: asset.clone(),
-            amount,
-            fee,
-            order_ref,
-            category,
-            chain_id: env.ledger().network_id(),
-        }
-        .publish(env);
-
+            merchant: merchant.clone(), payment_id: id, payer: payer.clone(), asset: asset.clone(), amount, fee,
+            order_ref, category, chain_id: env.ledger().network_id(),
+        }.publish(env);
         Self::invoke_merchant_callback(env, id, &merchant, payer, asset, amount);
         Ok(id)
     }
@@ -1111,22 +1237,11 @@ impl PaymentProcessor {
     /// running count, so the next ID cannot be read off a counter. A
     /// collision (or zero) moves on to the next nonce.
     fn new_payment_id(
-        env: &Env,
-        payer: &Address,
-        merchant: &Address,
-        order_ref: &String,
-        count: u64,
+        env: &Env, payer: &Address, merchant: &Address, order_ref: &String, sequence: u64,
     ) -> u64 {
         let mut nonce: u32 = 0;
         loop {
-            let seed = (
-                merchant.clone(),
-                order_ref.clone(),
-                payer.clone(),
-                count,
-                env.ledger().sequence(),
-                nonce,
-            );
+            let seed = (merchant.clone(), order_ref.clone(), payer.clone(), sequence, env.ledger().sequence(), nonce);
             let digest = env.crypto().sha256(&seed.to_xdr(env)).to_array();
             let mut head = [0u8; 8];
             head.copy_from_slice(&digest[..8]);
@@ -1180,11 +1295,65 @@ impl PaymentProcessor {
         }
     }
 
+    fn schedule_treasury_change(env: &Env, treasury: Address) -> Result<(), PaymentError> {
+        let execute_after = env
+            .ledger()
+            .timestamp()
+            .checked_add(TREASURY_CHANGE_DELAY)
+            .ok_or(PaymentError::Overflow)?;
+        let pending = PendingTreasuryChange {
+            treasury: treasury.clone(),
+            execute_after,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingTreasuryChange, &pending);
+        extend_instance(env);
+        TreasuryChangeScheduled { treasury, execute_after }.publish(env);
+        Ok(())
+    }
+
+    fn fee_split_for_asset(
+        env: &Env,
+        config: &Config,
+        asset: &Address,
+        amount: i128,
+    ) -> Result<(i128, i128), PaymentError> {
+        let Some(oracle) = env.storage().instance().get::<_, Address>(&DataKey::PriceOracle) else {
+            return split_fee(amount, config.fee_bps).ok_or(PaymentError::Overflow);
+        };
+        let oracle = PriceOracleClient::new(env, &oracle);
+        let normalized = oracle.normalize(asset, &amount);
+        if normalized <= 0 {
+            return Err(PaymentError::InvalidOracleQuote);
+        }
+        let normalized_fee =
+            bps_of(normalized, config.fee_bps).ok_or(PaymentError::Overflow)?;
+        let fee = oracle.denormalize(asset, &normalized_fee);
+        if fee < 0 || fee > amount {
+            return Err(PaymentError::InvalidOracleQuote);
+        }
+        let net = amount.checked_sub(fee).ok_or(PaymentError::Overflow)?;
+        Ok((fee, net))
+    }
+
     fn config(env: &Env) -> Result<Config, PaymentError> {
         env.storage()
             .instance()
             .get(&DataKey::Config)
             .ok_or(PaymentError::NotInitialized)
+    }
+
+    fn admin_roles(env: &Env) -> Result<AdminRoles, PaymentError> {
+        if let Some(roles) = env.storage().instance().get::<_, AdminRoles>(&DataKey::AdminRoles) {
+            return Ok(roles);
+        }
+        let config = Self::config(env)?;
+        Ok(AdminRoles {
+            fee_admin: config.admin.clone(),
+            dispute_admin: config.admin.clone(),
+            upgrade_admin: config.admin,
+        })
     }
 
     fn update(env: &Env, f: impl FnOnce(&mut Config)) -> Result<(), PaymentError> {
@@ -1236,22 +1405,16 @@ impl PaymentProcessor {
 
     /// Saves the proposal, applying its change first when it has enough approvals.
     fn apply_if_ready(
-        env: &Env,
-        gov: &Governance,
-        proposal: &mut ParamProposal,
+        env: &Env, gov: &Governance, proposal: &mut ParamProposal,
     ) -> Result<bool, PaymentError> {
         if proposal.approvals.len() >= gov.threshold {
             let config = Self::config(env)?;
             match proposal.change.clone() {
                 ParamChange::FeeBps(bps) => Self::store_config(env, config, |c| c.fee_bps = bps)?,
-                ParamChange::Treasury(t) => Self::store_config(env, config, |c| c.treasury = t)?,
+                ParamChange::Treasury(t) => { Self::schedule_treasury_change(env, t)?; },
             }
             proposal.executed = true;
-            ParamChangeApplied {
-                proposal_id: proposal.id,
-                change: proposal.change.clone(),
-            }
-            .publish(env);
+            ParamChangeApplied { proposal_id: proposal.id, change: proposal.change.clone() }.publish(env);
         }
         let key = DataKey::Proposal(proposal.id);
         env.storage().persistent().set(&key, proposal);
