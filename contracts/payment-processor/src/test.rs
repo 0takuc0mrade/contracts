@@ -516,3 +516,21 @@ fn treasury_redirect_is_delayed_for_seven_days() {
     s.pp.execute_treasury_change();
     assert_eq!(s.pp.get_config().treasury, next);
 }
+
+
+#[test]
+fn admin_roles_default_to_legacy_admin_and_can_be_separated() {
+    let s = setup(100);
+    let initial = s.pp.get_admin_roles();
+    assert_eq!(initial.fee_admin, initial.dispute_admin);
+    assert_eq!(initial.fee_admin, initial.upgrade_admin);
+
+    let fee_admin = Address::generate(&s.env);
+    let dispute_admin = Address::generate(&s.env);
+    let upgrade_admin = Address::generate(&s.env);
+    s.pp.set_admin_roles(&fee_admin, &dispute_admin, &upgrade_admin);
+    let roles = s.pp.get_admin_roles();
+    assert_eq!(roles.fee_admin, fee_admin);
+    assert_eq!(roles.dispute_admin, dispute_admin);
+    assert_eq!(roles.upgrade_admin, upgrade_admin);
+}

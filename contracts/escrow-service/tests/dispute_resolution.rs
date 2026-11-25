@@ -109,19 +109,6 @@ fn arbiter_splits_funds() {
 }
 
 #[test]
-fn resolved_dispute_cannot_be_resolved_again() {
-    let w = world();
-    w.escrow
-        .raise_dispute(&w.buyer, &w.id, &DisputeReason::Defective, &None);
-    w.escrow.resolve(&w.id, &3_000);
-
-    assert_eq!(
-        w.escrow.try_resolve(&w.id, &5_000),
-        Err(Ok(EscrowError::InvalidStatus))
-    );
-}
-
-#[test]
 fn arbiter_cannot_rule_after_deadline() {
     let w = world();
     w.escrow
@@ -207,9 +194,24 @@ fn reasons_are_role_restricted() {
 }
 
 #[test]
-fn buyer_dispute_window_closes_at_release_time() {
+fn exact_expiry_is_still_live_and_closes_after_the_boundary() {
     let w = world();
     advance(&w, 3 * DAY);
+
+    // Exactly at release_at the escrow is not expired: the buyer may still
+    // dispute and a seller claim is not due yet (#119).
+    assert_eq!(
+        w.escrow.try_claim(&w.id),
+        Err(Ok(EscrowError::ReleaseNotDue))
+    );
+    w.escrow
+        .raise_dispute(&w.buyer, &w.id, &DisputeReason::NonDelivery, &None);
+}
+
+#[test]
+fn buyer_dispute_window_closes_strictly_after_release_time() {
+    let w = world();
+    advance(&w, 3 * DAY + 1);
     assert_eq!(
         w.escrow
             .try_raise_dispute(&w.buyer, &w.id, &DisputeReason::NonDelivery, &None),

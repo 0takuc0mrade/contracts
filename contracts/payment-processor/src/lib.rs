@@ -208,6 +208,14 @@ pub struct PendingTreasuryChange {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminRoles {
+    pub fee_admin: Address,
+    pub dispute_admin: Address,
+    pub upgrade_admin: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
     pub admin: Address,
     pub registry: Address,
@@ -230,6 +238,7 @@ pub struct Delegation {
 #[derive(Clone)]
 enum DataKey {
     Config,
+    AdminRoles,
     PendingTreasuryChange,
     PriceOracle,
     PaymentCount,
@@ -340,6 +349,20 @@ pub struct ParamChangeApplied {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminRolesUpdated {
+    pub fee_admin: Address,
+    pub dispute_admin: Address,
+    pub upgrade_admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessorUpgraded {
+    pub upgrade_admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TreasuryChangeScheduled {
     pub treasury: Address,
     pub execute_after: u64,
@@ -427,6 +450,12 @@ impl PaymentProcessor {
             paused: false,
         };
         env.storage().instance().set(&DataKey::Config, &config);
+        let roles = AdminRoles {
+            fee_admin: config.admin.clone(),
+            dispute_admin: config.admin.clone(),
+            upgrade_admin: config.admin.clone(),
+        };
+        env.storage().instance().set(&DataKey::AdminRoles, &roles);
         env.storage().instance().set(&DataKey::PaymentCount, &0u64);
         env.storage().instance().set(&DataKey::NextPaymentId, &0u64);
         extend_instance(&env);
@@ -630,15 +659,50 @@ impl PaymentProcessor {
         if fee_bps > MAX_FEE_BPS {
             return Err(PaymentError::InvalidFeeRate);
         }
-        Self::update(&env, |c| c.fee_bps = fee_bps)
+        let roles = Self::admin_roles(&env)?;
+        roles.fee_admin.require_auth();
+        let config = Self::config(&env)?;
+        Self::store_config(&env, config, |c| c.fee_bps = fee_bps)
     }
 
     /// Admin-only until governance is enabled; then use `propose_param_change`.
     pub fn set_treasury(env: Env, treasury: Address) -> Result<(), PaymentError> {
         Self::require_no_governance(&env)?;
+        let roles = Self::admin_roles(&env)?;
+        roles.fee_admin.require_auth();
+        Self::schedule_treasury_change(&env, treasury)
+    }
+
+    pub fn get_admin_roles(env: Env) -> Result<AdminRoles, PaymentError> {
+        Self::admin_roles(&env)
+    }
+
+    pub fn set_admin_roles(
+        env: Env,
+        fee_admin: Address,
+        dispute_admin: Address,
+        upgrade_admin: Address,
+    ) -> Result<(), PaymentError> {
         let config = Self::config(&env)?;
         config.admin.require_auth();
-        Self::schedule_treasury_change(&env, treasury)
+        let roles = AdminRoles {
+            fee_admin: fee_admin.clone(),
+            dispute_admin: dispute_admin.clone(),
+            upgrade_admin: upgrade_admin.clone(),
+        };
+        env.storage().instance().set(&DataKey::AdminRoles, &roles);
+        extend_instance(&env);
+        AdminRolesUpdated { fee_admin, dispute_admin, upgrade_admin }.publish(&env);
+        Ok(())
+    }
+
+    pub fn upgrade(env: Env, wasm_hash: BytesN<32>) -> Result<(), PaymentError> {
+        let roles = Self::admin_roles(&env)?;
+        roles.upgrade_admin.require_auth();
+        let actor = roles.upgrade_admin.clone();
+        env.deployer().update_current_contract_wasm(wasm_hash);
+        ProcessorUpgraded { upgrade_admin: actor }.publish(&env);
+        Ok(())
     }
 
     /// Executes a previously approved treasury redirect after the seven-day
@@ -803,11 +867,17 @@ impl PaymentProcessor {
     }
 
     pub fn pause(env: Env) -> Result<(), PaymentError> {
-        Self::update(&env, |c| c.paused = true)
+        let roles = Self::admin_roles(&env)?;
+        roles.dispute_admin.require_auth();
+        let config = Self::config(&env)?;
+        Self::store_config(&env, config, |c| c.paused = true)
     }
 
     pub fn unpause(env: Env) -> Result<(), PaymentError> {
-        Self::update(&env, |c| c.paused = false)
+        let roles = Self::admin_roles(&env)?;
+        roles.dispute_admin.require_auth();
+        let config = Self::config(&env)?;
+        Self::store_config(&env, config, |c| c.paused = false)
     }
 
     // ---------------------------------------------------------------------
@@ -1158,6 +1228,18 @@ impl PaymentProcessor {
             .instance()
             .get(&DataKey::Config)
             .ok_or(PaymentError::NotInitialized)
+    }
+
+    fn admin_roles(env: &Env) -> Result<AdminRoles, PaymentError> {
+        if let Some(roles) = env.storage().instance().get::<_, AdminRoles>(&DataKey::AdminRoles) {
+            return Ok(roles);
+        }
+        let config = Self::config(env)?;
+        Ok(AdminRoles {
+            fee_admin: config.admin.clone(),
+            dispute_admin: config.admin.clone(),
+            upgrade_admin: config.admin,
+        })
     }
 
     fn update(env: &Env, f: impl FnOnce(&mut Config)) -> Result<(), PaymentError> {

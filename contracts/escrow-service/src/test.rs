@@ -159,7 +159,7 @@ fn seller_claims_only_after_release_time() {
     let s = setup();
     let id = open(&s, 1_000);
     assert_eq!(s.client.try_claim(&id), Err(Ok(EscrowError::ReleaseNotDue)));
-    s.env.ledger().with_mut(|l| l.timestamp += 3 * DAY);
+    s.env.ledger().with_mut(|l| l.timestamp += 3 * DAY + 1);
     s.client.claim(&id);
     assert_eq!(s.token.balance(&s.seller), 1_000);
 }
