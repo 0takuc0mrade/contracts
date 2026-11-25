@@ -4,7 +4,7 @@ use super::*;
 use loyalty_program::{LoyaltyProgram, LoyaltyProgramClient};
 use merchant_registry::{MerchantRegistry, MerchantRegistryClient};
 use soroban_sdk::{
-    testutils::{Address as _, Events},
+    testutils::{Address as _, Events, Ledger},
     token::StellarAssetClient,
     vec, Env, Event, String,
 };
@@ -470,6 +470,51 @@ fn batch_size_limits_and_pause() {
         ),
         Err(Ok(PaymentError::Paused))
     );
+}
+
+
+#[contract]
+struct TestPriceOracle;
+
+#[contractimpl]
+impl TestPriceOracle {
+    pub fn normalize(_env: Env, _asset: Address, amount: i128) -> i128 { amount * 2 }
+    pub fn denormalize(_env: Env, _asset: Address, amount: i128) -> i128 { amount / 2 }
+}
+
+#[test]
+fn oracle_normalization_is_used_for_asset_fee_quotes() {
+    let s = setup(250);
+    let oracle = s.env.register(TestPriceOracle, ());
+    s.pp.set_price_oracle(&Some(oracle));
+    let (fee, net) = s.pp.quote_in_asset(&s.asset, &(100 * UNIT));
+    assert_eq!(fee, 25 * UNIT / 10);
+    assert_eq!(fee + net, 100 * UNIT);
+}
+
+#[test]
+fn batch_total_overflow_is_rejected_before_settlement() {
+    let s = setup(0);
+    let lines = vec![
+        &s.env,
+        BatchLine { merchant: s.merchant.clone(), amount: i128::MAX, order_ref: order(&s.env, "OVERFLOW-1"), category: order(&s.env, "batch") },
+        BatchLine { merchant: s.merchant.clone(), amount: 1, order_ref: order(&s.env, "OVERFLOW-2"), category: order(&s.env, "batch") },
+    ];
+    assert_eq!(s.pp.try_pay_batch(&s.payer, &s.asset, &lines), Err(Ok(PaymentError::Overflow)));
+}
+
+#[test]
+fn treasury_redirect_is_delayed_for_seven_days() {
+    let s = setup(100);
+    let next = Address::generate(&s.env);
+    let now = s.env.ledger().timestamp();
+    s.pp.set_treasury(&next);
+    assert_eq!(s.pp.get_config().treasury, s.treasury);
+    assert_eq!(s.pp.get_pending_treasury_change().unwrap().execute_after, now + TREASURY_CHANGE_DELAY);
+    assert_eq!(s.pp.try_execute_treasury_change(), Err(Ok(PaymentError::TreasuryChangeNotReady)));
+    s.env.ledger().with_mut(|l| l.timestamp = now + TREASURY_CHANGE_DELAY);
+    s.pp.execute_treasury_change();
+    assert_eq!(s.pp.get_config().treasury, next);
 }
 
 

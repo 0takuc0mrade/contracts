@@ -45,6 +45,9 @@ pub const MAX_ROYALTY_RECIPIENTS: u32 = 5;
 pub const MAX_COUNCIL: u32 = 10;
 /// Most contributing buyers in one split_payment call.
 pub const MAX_SPLITS: u32 = 20;
+/// Fee-recipient changes are deliberately delayed to give governance/users time
+/// to react to a malicious redirect (#105).
+pub const TREASURY_CHANGE_DELAY: u64 = 7 * 24 * 60 * 60;
 
 /// The subset of the merchant registry this contract calls.
 #[allow(dead_code)]
@@ -59,6 +62,15 @@ pub trait RegistryInterface {
 pub trait LoyaltyInterface {
     fn accrue(env: Env, caller: Address, merchant: Address, customer: Address, amount: i128)
         -> u64;
+}
+
+/// Price-normalization oracle used to calculate fees in a common denomination.
+/// The returned fee is converted back into the payment asset before transfer.
+#[allow(dead_code)]
+#[contractclient(name = "PriceOracleClient")]
+pub trait PriceOracleInterface {
+    fn normalize(env: Env, asset: Address, amount: i128) -> i128;
+    fn denormalize(env: Env, asset: Address, normalized_amount: i128) -> i128;
 }
 
 /// Optional merchant callback invoked after a payment settles.
@@ -104,6 +116,9 @@ pub enum PaymentError {
     TransferFailed = 22,
     InvalidSplit = 23,
     Reentrancy = 24,
+    NoPendingTreasuryChange = 25,
+    TreasuryChangeNotReady = 26,
+    InvalidOracleQuote = 27,
 }
 
 #[contracttype]
@@ -186,12 +201,16 @@ pub struct SplitShare {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingTreasuryChange {
+    pub treasury: Address,
+    pub execute_after: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminRoles {
-    /// Controls protocol fee and fee-recipient/treasury parameters.
     pub fee_admin: Address,
-    /// Controls emergency pause/unpause operations.
     pub dispute_admin: Address,
-    /// Controls contract wasm replacement.
     pub upgrade_admin: Address,
 }
 
@@ -220,6 +239,8 @@ pub struct Delegation {
 enum DataKey {
     Config,
     AdminRoles,
+    PendingTreasuryChange,
+    PriceOracle,
     PaymentCount,
     NextPaymentId,
     MerchantPaymentCount(Address),
@@ -338,6 +359,25 @@ pub struct AdminRolesUpdated {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessorUpgraded {
     pub upgrade_admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryChangeScheduled {
+    pub treasury: Address,
+    pub execute_after: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryChangeExecuted {
+    pub treasury: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PriceOracleUpdated {
+    pub oracle: Option<Address>,
 }
 
 #[contractevent]
@@ -534,6 +574,12 @@ impl PaymentProcessor {
             if config.paused { return Err(PaymentError::Paused); }
             if lines.is_empty() || lines.len() > MAX_BATCH { return Err(PaymentError::InvalidBatch); }
             payer.require_auth();
+            let mut batch_total: i128 = 0;
+            for line in lines.iter() {
+                if line.amount <= 0 { return Err(PaymentError::InvalidAmount); }
+                batch_total = batch_total.checked_add(line.amount).ok_or(PaymentError::Overflow)?;
+            }
+            if batch_total <= 0 { return Err(PaymentError::InvalidAmount); }
             let mut targets: Map<Address, Address> = Map::new(&env);
             let mut ids = Vec::new(&env);
             for line in lines.iter() {
@@ -624,18 +670,13 @@ impl PaymentProcessor {
         Self::require_no_governance(&env)?;
         let roles = Self::admin_roles(&env)?;
         roles.fee_admin.require_auth();
-        let config = Self::config(&env)?;
-        Self::store_config(&env, config, |c| c.treasury = treasury)
+        Self::schedule_treasury_change(&env, treasury)
     }
 
-    /// Returns the least-privilege administrators. Existing deployments start
-    /// with all three roles equal to the legacy admin.
     pub fn get_admin_roles(env: Env) -> Result<AdminRoles, PaymentError> {
         Self::admin_roles(&env)
     }
 
-    /// Reassigns operational roles. The legacy root admin authorizes role
-    /// assignment, while day-to-day privileged actions use their own role.
     pub fn set_admin_roles(
         env: Env,
         fee_admin: Address,
@@ -655,7 +696,6 @@ impl PaymentProcessor {
         Ok(())
     }
 
-    /// Replaces this contract's wasm using only the upgrade administrator.
     pub fn upgrade(env: Env, wasm_hash: BytesN<32>) -> Result<(), PaymentError> {
         let roles = Self::admin_roles(&env)?;
         roles.upgrade_admin.require_auth();
@@ -663,6 +703,49 @@ impl PaymentProcessor {
         env.deployer().update_current_contract_wasm(wasm_hash);
         ProcessorUpgraded { upgrade_admin: actor }.publish(&env);
         Ok(())
+    }
+
+    /// Executes a previously approved treasury redirect after the seven-day
+    /// safety delay. Permissionless execution prevents an admin from holding
+    /// an approved change hostage while preserving the full timelock.
+    pub fn execute_treasury_change(env: Env) -> Result<(), PaymentError> {
+        let pending: PendingTreasuryChange = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingTreasuryChange)
+            .ok_or(PaymentError::NoPendingTreasuryChange)?;
+        if env.ledger().timestamp() < pending.execute_after {
+            return Err(PaymentError::TreasuryChangeNotReady);
+        }
+        let config = Self::config(&env)?;
+        let treasury = pending.treasury.clone();
+        Self::store_config(&env, config, |c| c.treasury = treasury.clone())?;
+        env.storage().instance().remove(&DataKey::PendingTreasuryChange);
+        extend_instance(&env);
+        TreasuryChangeExecuted { treasury }.publish(&env);
+        Ok(())
+    }
+
+    pub fn get_pending_treasury_change(env: Env) -> Option<PendingTreasuryChange> {
+        env.storage().instance().get(&DataKey::PendingTreasuryChange)
+    }
+
+    /// Configures the oracle that normalizes payment values before fee math.
+    /// `None` keeps the legacy same-denomination calculation.
+    pub fn set_price_oracle(env: Env, oracle: Option<Address>) -> Result<(), PaymentError> {
+        let config = Self::config(&env)?;
+        config.admin.require_auth();
+        match oracle.clone() {
+            Some(address) => env.storage().instance().set(&DataKey::PriceOracle, &address),
+            None => env.storage().instance().remove(&DataKey::PriceOracle),
+        }
+        extend_instance(&env);
+        PriceOracleUpdated { oracle }.publish(&env);
+        Ok(())
+    }
+
+    pub fn get_price_oracle(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PriceOracle)
     }
 
     // ---------------------------------------------------------------------
@@ -919,6 +1002,20 @@ impl PaymentProcessor {
         split_fee(amount, Self::config(&env)?.fee_bps).ok_or(PaymentError::Overflow)
     }
 
+    /// Asset-aware fee quote. When an oracle is configured the amount is
+    /// normalized into the common denomination before fee calculation (#107).
+    pub fn quote_in_asset(
+        env: Env,
+        asset: Address,
+        amount: i128,
+    ) -> Result<(i128, i128), PaymentError> {
+        if amount <= 0 {
+            return Err(PaymentError::InvalidAmount);
+        }
+        let config = Self::config(&env)?;
+        Self::fee_split_for_asset(&env, &config, &asset, amount)
+    }
+
     // ---------------------------------------------------------------------
     // Internals
     // ---------------------------------------------------------------------
@@ -947,7 +1044,7 @@ impl PaymentProcessor {
         if order_ref.is_empty() || order_ref.len() > MAX_ORDER_REF_LEN { return Err(PaymentError::InvalidOrderRef); }
         let order_key = DataKey::Order(merchant.clone(), order_ref.clone());
         if is_entry_valid(env, &order_key) { return Err(PaymentError::DuplicateOrder); }
-        let (fee, net) = split_fee(amount, config.fee_bps).ok_or(PaymentError::Overflow)?;
+        let (fee, net) = Self::fee_split_for_asset(env, config, asset, amount)?;
         let sequence: u64 = env.storage().instance().get(&DataKey::NextPaymentId).unwrap_or(0u64)
             .checked_add(1).ok_or(PaymentError::Overflow)?;
         let active_count = Self::payment_count(env.clone()).checked_add(1).ok_or(PaymentError::Overflow)?;
@@ -1084,18 +1181,46 @@ impl PaymentProcessor {
         }
     }
 
-    fn admin_roles(env: &Env) -> Result<AdminRoles, PaymentError> {
-        if let Some(roles) = env.storage().instance().get(&DataKey::AdminRoles) {
-            return Ok(roles);
+    fn schedule_treasury_change(env: &Env, treasury: Address) -> Result<(), PaymentError> {
+        let execute_after = env
+            .ledger()
+            .timestamp()
+            .checked_add(TREASURY_CHANGE_DELAY)
+            .ok_or(PaymentError::Overflow)?;
+        let pending = PendingTreasuryChange {
+            treasury: treasury.clone(),
+            execute_after,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingTreasuryChange, &pending);
+        extend_instance(env);
+        TreasuryChangeScheduled { treasury, execute_after }.publish(env);
+        Ok(())
+    }
+
+    fn fee_split_for_asset(
+        env: &Env,
+        config: &Config,
+        asset: &Address,
+        amount: i128,
+    ) -> Result<(i128, i128), PaymentError> {
+        let Some(oracle) = env.storage().instance().get::<_, Address>(&DataKey::PriceOracle) else {
+            return split_fee(amount, config.fee_bps).ok_or(PaymentError::Overflow);
+        };
+        let oracle = PriceOracleClient::new(env, &oracle);
+        let normalized = oracle.normalize(asset, &amount);
+        if normalized <= 0 {
+            return Err(PaymentError::InvalidOracleQuote);
         }
-        // Compatibility for pre-role deployments: every role initially maps
-        // to the legacy admin until `set_admin_roles` is called.
-        let admin = Self::config(env)?.admin;
-        Ok(AdminRoles {
-            fee_admin: admin.clone(),
-            dispute_admin: admin.clone(),
-            upgrade_admin: admin,
-        })
+        let normalized_fee =
+            bps_of(normalized, config.fee_bps).ok_or(PaymentError::Overflow)?;
+        let fee = oracle.denormalize(asset, &normalized_fee);
+        if fee < 0 || fee > amount {
+            return Err(PaymentError::InvalidOracleQuote);
+        }
+        let net = amount.checked_sub(fee).ok_or(PaymentError::Overflow)?;
+        Ok((fee, net))
     }
 
     fn config(env: &Env) -> Result<Config, PaymentError> {
@@ -1103,6 +1228,24 @@ impl PaymentProcessor {
             .instance()
             .get(&DataKey::Config)
             .ok_or(PaymentError::NotInitialized)
+    }
+
+    fn admin_roles(env: &Env) -> Result<AdminRoles, PaymentError> {
+        if let Some(roles) = env.storage().instance().get::<_, AdminRoles>(&DataKey::AdminRoles) {
+            return Ok(roles);
+        }
+        let config = Self::config(env)?;
+        Ok(AdminRoles {
+            fee_admin: config.admin.clone(),
+            dispute_admin: config.admin.clone(),
+            upgrade_admin: config.admin,
+        })
+    }
+
+    fn update(env: &Env, f: impl FnOnce(&mut Config)) -> Result<(), PaymentError> {
+        let config = Self::config(env)?;
+        config.admin.require_auth();
+        Self::store_config(env, config, f)
     }
 
     /// Applies `f` to the config and publishes the change. Callers check auth.
@@ -1154,7 +1297,7 @@ impl PaymentProcessor {
             let config = Self::config(env)?;
             match proposal.change.clone() {
                 ParamChange::FeeBps(bps) => Self::store_config(env, config, |c| c.fee_bps = bps)?,
-                ParamChange::Treasury(t) => { Self::store_config(env, config, |c| c.treasury = t)?; },
+                ParamChange::Treasury(t) => { Self::schedule_treasury_change(env, t)?; },
             }
             proposal.executed = true;
             ParamChangeApplied { proposal_id: proposal.id, change: proposal.change.clone() }.publish(env);
