@@ -139,6 +139,11 @@ fn empty_name_is_rejected() {
         &vec![&s.env],
     );
     assert_eq!(res, Err(Ok(RegistryError::InvalidName)));
+    assert_eq!(s.client.merchant_count(), 0);
+    assert_eq!(
+        s.client.try_get_merchant(&s.owner),
+        Err(Ok(RegistryError::MerchantNotFound))
+    );
 }
 
 #[test]
