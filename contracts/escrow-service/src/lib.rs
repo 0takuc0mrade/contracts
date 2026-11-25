@@ -35,6 +35,11 @@ use soroban_sdk::{
 
 pub const MAX_EVIDENCE: u32 = 10;
 pub const MIN_ESCROW_LOCK_PERIOD: u64 = 60 * 60;
+/// Protected period after nominal release during which buyer disputes remain open (#123).
+pub const SETTLEMENT_GRACE_PERIOD: u64 = 5 * 60;
+/// Approximate Stellar close time used to convert dispute windows to ledger sequence (#128).
+pub const LEDGER_CLOSE_SECONDS: u64 = 5;
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 pub const MIN_ARBITRATION_WINDOW: u64 = 60 * 60;
 pub const MAX_ARBITRATION_WINDOW: u64 = 30 * 24 * 60 * 60;
 /// Premium charged for an insured escrow (1% of the payment amount).
@@ -64,6 +69,7 @@ pub enum EscrowError {
     DeadlinePassed = 16,
     InvalidSplit = 17,
     Overflow = 18,
+    UnsupportedSchemaVersion = 19,
 }
 
 #[contracttype]
@@ -156,6 +162,8 @@ enum DataKey {
     Evidence(u64),
     Insured(u64),
     InsurancePool(Address),
+    DisputeDeadlineLedger(u64),
+    SchemaVersion,
     MinLockPeriod,
     LockUntil(u64),
 }
@@ -217,6 +225,19 @@ pub struct EscrowLockPeriodChanged {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageMigrated {
+    pub from_version: u32,
+    pub to_version: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractUpgraded {
+    pub schema_version: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DirectPayment {
     #[topic]
     pub buyer: Address,
@@ -245,6 +266,7 @@ impl EscrowService {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().set(&DataKey::Count, &0u64);
+        env.storage().instance().set(&DataKey::SchemaVersion, &CURRENT_SCHEMA_VERSION);
         extend_instance(&env);
         Ok(())
     }
@@ -436,11 +458,14 @@ impl EscrowService {
         Self::require_not_paused(&env)?;
         let mut escrow = Self::funded(&env, id)?;
         escrow.seller.require_auth();
-        Self::require_release_unlocked(&env, &escrow)?;
         // The escrow remains live through the exact release ledger close.
         // A claim is due only strictly after `release_at`, so a transaction at
         // the boundary is not incorrectly treated as expired (#119).
-        if env.ledger().timestamp() <= escrow.release_at {
+        let claim_after = escrow
+            .release_at
+            .checked_add(SETTLEMENT_GRACE_PERIOD)
+            .ok_or(EscrowError::Overflow)?;
+        if env.ledger().timestamp() <= claim_after {
             return Err(EscrowError::ReleaseNotDue);
         }
         let amount = escrow.remaining();
@@ -481,7 +506,11 @@ impl EscrowService {
         // dispute any time while funded, to get a ruling sooner than
         // release_at (e.g. a buyer blocking a partial release).
         let window_open = match role {
-            PartyRole::Buyer => now <= escrow.release_at,
+            PartyRole::Buyer => now
+                <= escrow
+                    .release_at
+                    .checked_add(SETTLEMENT_GRACE_PERIOD)
+                    .ok_or(EscrowError::Overflow)?,
             PartyRole::Seller => true,
         };
         if !window_open {
@@ -492,6 +521,14 @@ impl EscrowService {
             .checked_add(escrow.arbitration_window)
             .ok_or(EscrowError::Overflow)?
             .max(Self::lock_until(&env, &escrow));
+        let deadline_ledger = env
+            .ledger()
+            .sequence()
+            .checked_add(Self::seconds_to_ledgers(escrow.arbitration_window)?)
+            .ok_or(EscrowError::Overflow)?;
+        let deadline_key = DataKey::DisputeDeadlineLedger(id);
+        env.storage().persistent().set(&deadline_key, &deadline_ledger);
+        extend_persistent(&env, &deadline_key);
         escrow.status = EscrowStatus::Disputed;
         Self::save(&env, &escrow);
         Self::save_dispute(
@@ -541,7 +578,7 @@ impl EscrowService {
         let escrow = Self::disputed(&env, id)?;
         escrow.arbiter.require_auth();
         let dispute = Self::load_dispute(&env, id)?;
-        if env.ledger().timestamp() > dispute.deadline {
+        if Self::dispute_deadline_passed(&env, id, &dispute)? {
             return Err(EscrowError::DeadlinePassed);
         }
         Self::settle_dispute(&env, escrow, dispute, buyer_bps, false)
@@ -552,7 +589,7 @@ impl EscrowService {
     pub fn resolve_by_default(env: Env, id: u64) -> Result<u32, EscrowError> {
         let escrow = Self::disputed(&env, id)?;
         let dispute = Self::load_dispute(&env, id)?;
-        if env.ledger().timestamp() <= dispute.deadline {
+        if !Self::dispute_deadline_passed(&env, id, &dispute)? {
             return Err(EscrowError::DeadlineNotPassed);
         }
         let bps = dispute.reason.default_buyer_bps();
@@ -563,6 +600,23 @@ impl EscrowService {
     // ---------------------------------------------------------------------
     // Admin and views
     // ---------------------------------------------------------------------
+
+    pub fn migrate(env: Env) -> Result<u32, EscrowError> {
+        Self::admin(&env)?.require_auth();
+        Self::migrate_storage(&env)
+    }
+
+    pub fn upgrade(env: Env, wasm_hash: BytesN<32>) -> Result<(), EscrowError> {
+        Self::admin(&env)?.require_auth();
+        let version = Self::migrate_storage(&env)?;
+        env.deployer().update_current_contract_wasm(wasm_hash);
+        ContractUpgraded { schema_version: version }.publish(&env);
+        Ok(())
+    }
+
+    pub fn schema_version(env: Env) -> u32 {
+        env.storage().instance().get(&DataKey::SchemaVersion).unwrap_or(0)
+    }
 
     pub fn pause(env: Env) -> Result<(), EscrowError> {
         Self::admin(&env)?.require_auth();
@@ -613,6 +667,40 @@ impl EscrowService {
     // ---------------------------------------------------------------------
     // Internals
     // ---------------------------------------------------------------------
+
+    fn migrate_storage(env: &Env) -> Result<u32, EscrowError> {
+        let from: u32 = env.storage().instance().get(&DataKey::SchemaVersion).unwrap_or(0);
+        if from > CURRENT_SCHEMA_VERSION {
+            return Err(EscrowError::UnsupportedSchemaVersion);
+        }
+        if from < CURRENT_SCHEMA_VERSION {
+            env.storage().instance().set(&DataKey::SchemaVersion, &CURRENT_SCHEMA_VERSION);
+            extend_instance(env);
+            StorageMigrated { from_version: from, to_version: CURRENT_SCHEMA_VERSION }.publish(env);
+        }
+        Ok(CURRENT_SCHEMA_VERSION)
+    }
+
+    fn seconds_to_ledgers(seconds: u64) -> Result<u32, EscrowError> {
+        let ledgers = seconds
+            .checked_add(LEDGER_CLOSE_SECONDS - 1)
+            .ok_or(EscrowError::Overflow)?
+            / LEDGER_CLOSE_SECONDS;
+        u32::try_from(ledgers).map_err(|_| EscrowError::Overflow)
+    }
+
+    fn dispute_deadline_passed(
+        env: &Env,
+        id: u64,
+        dispute: &Dispute,
+    ) -> Result<bool, EscrowError> {
+        let key = DataKey::DisputeDeadlineLedger(id);
+        if let Some(deadline_ledger) = env.storage().persistent().get::<_, u32>(&key) {
+            extend_persistent(env, &key);
+            return Ok(env.ledger().sequence() > deadline_ledger);
+        }
+        Ok(env.ledger().timestamp() > dispute.deadline)
+    }
 
     fn admin(env: &Env) -> Result<Address, EscrowError> {
         env.storage()
