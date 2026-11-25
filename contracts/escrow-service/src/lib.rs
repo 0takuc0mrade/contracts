@@ -34,15 +34,13 @@ use soroban_sdk::{
 };
 
 pub const MAX_EVIDENCE: u32 = 10;
-pub const MIN_ARBITRATION_WINDOW: u64 = 60 * 60;
-pub const MAX_ARBITRATION_WINDOW: u64 = 30 * 24 * 60 * 60;
-/// Protected period after the nominal release time during which a buyer can
-/// still raise a dispute before the seller may claim funds (#123).
+/// Protected period after nominal release during which buyer disputes remain open (#123).
 pub const SETTLEMENT_GRACE_PERIOD: u64 = 5 * 60;
-/// Stellar ledgers close approximately every five seconds. Dispute-resolution
-/// deadlines use ledger sequence so wall-clock skew cannot shorten a window (#128).
+/// Approximate Stellar close time used to convert dispute windows to ledger sequence (#128).
 pub const LEDGER_CLOSE_SECONDS: u64 = 5;
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const MIN_ARBITRATION_WINDOW: u64 = 60 * 60;
+pub const MAX_ARBITRATION_WINDOW: u64 = 30 * 24 * 60 * 60;
 /// Premium charged for an insured escrow (1% of the payment amount).
 pub const INSURANCE_PREMIUM_BPS: u32 = 100;
 /// Maximum seller reimbursement for a buyer refund (10% of the escrow amount).
@@ -163,8 +161,6 @@ enum DataKey {
     Evidence(u64),
     Insured(u64),
     InsurancePool(Address),
-    /// Ledger-sequence deadline for newly raised disputes. Legacy disputes
-    /// without this entry fall back to their timestamp deadline.
     DisputeDeadlineLedger(u64),
     SchemaVersion,
 }
@@ -261,9 +257,7 @@ impl EscrowService {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().set(&DataKey::Count, &0u64);
-        env.storage()
-            .instance()
-            .set(&DataKey::SchemaVersion, &CURRENT_SCHEMA_VERSION);
+        env.storage().instance().set(&DataKey::SchemaVersion, &CURRENT_SCHEMA_VERSION);
         extend_instance(&env);
         Ok(())
     }
@@ -447,6 +441,9 @@ impl EscrowService {
         Self::require_not_paused(&env)?;
         let mut escrow = Self::funded(&env, id)?;
         escrow.seller.require_auth();
+        // The escrow remains live through the exact release ledger close.
+        // A claim is due only strictly after `release_at`, so a transaction at
+        // the boundary is not incorrectly treated as expired (#119).
         let claim_after = escrow
             .release_at
             .checked_add(SETTLEMENT_GRACE_PERIOD)
@@ -586,15 +583,11 @@ impl EscrowService {
     // Admin and views
     // ---------------------------------------------------------------------
 
-    /// Migrates legacy instance metadata to the schema understood by this wasm.
-    /// Safe to call repeatedly; only the configured admin may migrate.
     pub fn migrate(env: Env) -> Result<u32, EscrowError> {
         Self::admin(&env)?.require_auth();
         Self::migrate_storage(&env)
     }
 
-    /// Migrates storage first, then replaces the current contract wasm. This
-    /// makes migration an explicit part of every in-place upgrade (#127).
     pub fn upgrade(env: Env, wasm_hash: BytesN<32>) -> Result<(), EscrowError> {
         Self::admin(&env)?.require_auth();
         let version = Self::migrate_storage(&env)?;
@@ -604,10 +597,7 @@ impl EscrowService {
     }
 
     pub fn schema_version(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::SchemaVersion)
-            .unwrap_or(0)
+        env.storage().instance().get(&DataKey::SchemaVersion).unwrap_or(0)
     }
 
     pub fn pause(env: Env) -> Result<(), EscrowError> {
@@ -651,15 +641,9 @@ impl EscrowService {
             return Err(EscrowError::UnsupportedSchemaVersion);
         }
         if from < CURRENT_SCHEMA_VERSION {
-            env.storage()
-                .instance()
-                .set(&DataKey::SchemaVersion, &CURRENT_SCHEMA_VERSION);
+            env.storage().instance().set(&DataKey::SchemaVersion, &CURRENT_SCHEMA_VERSION);
             extend_instance(env);
-            StorageMigrated {
-                from_version: from,
-                to_version: CURRENT_SCHEMA_VERSION,
-            }
-            .publish(env);
+            StorageMigrated { from_version: from, to_version: CURRENT_SCHEMA_VERSION }.publish(env);
         }
         Ok(CURRENT_SCHEMA_VERSION)
     }
@@ -682,7 +666,6 @@ impl EscrowService {
             extend_persistent(env, &key);
             return Ok(env.ledger().sequence() > deadline_ledger);
         }
-        // Compatibility for disputes created by older wasm before #128.
         Ok(env.ledger().timestamp() > dispute.deadline)
     }
 
