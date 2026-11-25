@@ -42,6 +42,7 @@ pub const LEDGER_CLOSE_SECONDS: u64 = 5;
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 pub const MIN_ARBITRATION_WINDOW: u64 = 60 * 60;
 pub const MAX_ARBITRATION_WINDOW: u64 = 30 * 24 * 60 * 60;
+pub const DEFAULT_ARBITRATION_WINDOW: u64 = 7 * 24 * 60 * 60;
 /// Premium charged for an insured escrow (1% of the payment amount).
 pub const INSURANCE_PREMIUM_BPS: u32 = 100;
 /// Maximum seller reimbursement for a buyer refund (10% of the escrow amount).
@@ -162,10 +163,10 @@ enum DataKey {
     Evidence(u64),
     Insured(u64),
     InsurancePool(Address),
-    DisputeDeadlineLedger(u64),
-    SchemaVersion,
-    MinLockPeriod,
-    LockUntil(u64),
+    Registry,
+    MerchantEscrows(Address),
+    DefaultArbitrationWindow,
+    MerchantArbitrationWindow(Address),
 }
 
 #[contractevent]
@@ -266,7 +267,10 @@ impl EscrowService {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().set(&DataKey::Count, &0u64);
-        env.storage().instance().set(&DataKey::SchemaVersion, &CURRENT_SCHEMA_VERSION);
+        env.storage().instance().set(
+            &DataKey::DefaultArbitrationWindow,
+            &DEFAULT_ARBITRATION_WINDOW,
+        );
         extend_instance(&env);
         Ok(())
     }
@@ -324,12 +328,12 @@ impl EscrowService {
             return Err(EscrowError::InvalidParties);
         }
         let now = env.ledger().timestamp();
-        let lock_until = now
-            .checked_add(Self::min_lock_period(env.clone()))
-            .ok_or(EscrowError::Overflow)?;
-        if release_at < lock_until
-            || !(MIN_ARBITRATION_WINDOW..=MAX_ARBITRATION_WINDOW).contains(&arbitration_window)
-        {
+        let arbitration_window = if arbitration_window == 0 {
+            Self::resolve_arbitration_window(&env, &seller)
+        } else {
+            arbitration_window
+        };
+        if release_at <= now || !Self::valid_arbitration_window(arbitration_window) {
             return Err(EscrowError::InvalidSchedule);
         }
 
@@ -351,9 +355,7 @@ impl EscrowService {
             created_at: now,
         };
         Self::save(&env, &escrow);
-        let lock_key = DataKey::LockUntil(id);
-        env.storage().persistent().set(&lock_key, &lock_until);
-        extend_persistent(&env, &lock_key);
+        Self::track_merchant_escrow(&env, &seller, id);
         env.storage().instance().set(&DataKey::Count, &id);
         extend_instance(&env);
 
@@ -481,6 +483,78 @@ impl EscrowService {
         let amount = escrow.remaining();
         Self::payout(&env, &mut escrow, 0, amount, EscrowStatus::Refunded);
         Ok(())
+    }
+
+    /// Configures the registry that is allowed to cancel a merchant's active
+    /// escrows during deregistration.
+    pub fn set_registry(env: Env, registry: Address) -> Result<(), EscrowError> {
+        Self::admin(&env)?.require_auth();
+        env.storage().instance().set(&DataKey::Registry, &registry);
+        extend_instance(&env);
+        Ok(())
+    }
+
+    /// Sets the default dispute window. Passing zero to `create` uses this
+    /// value, while an explicit non-zero value remains a per-escrow override.
+    pub fn set_default_arbitration_window(env: Env, window: u64) -> Result<(), EscrowError> {
+        Self::admin(&env)?.require_auth();
+        if !Self::valid_arbitration_window(window) {
+            return Err(EscrowError::InvalidSchedule);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::DefaultArbitrationWindow, &window);
+        extend_instance(&env);
+        Ok(())
+    }
+
+    /// Sets a merchant-specific default dispute window.
+    pub fn set_merchant_arbitration_window(
+        env: Env,
+        merchant: Address,
+        window: u64,
+    ) -> Result<(), EscrowError> {
+        Self::admin(&env)?.require_auth();
+        if !Self::valid_arbitration_window(window) {
+            return Err(EscrowError::InvalidSchedule);
+        }
+        let key = DataKey::MerchantArbitrationWindow(merchant);
+        env.storage().persistent().set(&key, &window);
+        extend_persistent(&env, &key);
+        Ok(())
+    }
+
+    pub fn arbitration_window(env: Env, merchant: Address) -> u64 {
+        Self::resolve_arbitration_window(&env, &merchant)
+    }
+
+    /// Refunds all funded or disputed escrows belonging to a deregistered
+    /// merchant. Contract authorization is checked against the configured
+    /// registry, so callers cannot impersonate the registry account.
+    pub fn cancel_for_merchant(env: Env, merchant: Address) -> u32 {
+        let registry: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Registry)
+            .expect("escrow registry is not configured");
+        registry.require_auth();
+        let key = DataKey::MerchantEscrows(merchant);
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut cancelled = 0;
+        for id in ids.iter() {
+            if let Ok(mut escrow) = Self::load(&env, id) {
+                if matches!(escrow.status, EscrowStatus::Funded | EscrowStatus::Disputed) {
+                    let amount = escrow.remaining();
+                    Self::payout(&env, &mut escrow, 0, amount, EscrowStatus::Refunded);
+                    cancelled += 1;
+                }
+            }
+        }
+        cancelled
     }
 
     // ---------------------------------------------------------------------
@@ -707,6 +781,34 @@ impl EscrowService {
             .instance()
             .get(&DataKey::Admin)
             .ok_or(EscrowError::NotInitialized)
+    }
+
+    fn valid_arbitration_window(window: u64) -> bool {
+        (MIN_ARBITRATION_WINDOW..=MAX_ARBITRATION_WINDOW).contains(&window)
+    }
+
+    fn resolve_arbitration_window(env: &Env, merchant: &Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantArbitrationWindow(merchant.clone()))
+            .or_else(|| {
+                env.storage()
+                    .instance()
+                    .get(&DataKey::DefaultArbitrationWindow)
+            })
+            .unwrap_or(DEFAULT_ARBITRATION_WINDOW)
+    }
+
+    fn track_merchant_escrow(env: &Env, merchant: &Address, id: u64) {
+        let key = DataKey::MerchantEscrows(merchant.clone());
+        let mut ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        ids.push_back(id);
+        env.storage().persistent().set(&key, &ids);
+        extend_persistent(env, &key);
     }
 
     fn require_not_paused(env: &Env) -> Result<(), EscrowError> {

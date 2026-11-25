@@ -20,6 +20,8 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
+      - name: Compile every contract
+        run: cargo check --workspace --lib
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
